@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -62,7 +62,7 @@ class ChartPattern:
     end_index: int
     key_levels: Dict[str, float]
     description: str
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -594,15 +594,15 @@ class ChartPatternDetector:
         high = prices["high"].values
         low = prices["low"].values
         close = prices["close"].values
-        n = len(prices)
+        num_bars = len(prices)
 
-        if n < self.triangle_min_bars:
+        if num_bars < self.triangle_min_bars:
             return patterns
 
-        x = np.arange(n, dtype=float)
+        bar_indices = np.arange(num_bars, dtype=float)
 
-        high_slope, high_intercept, high_r2 = self._fit_trendline(x, high)
-        low_slope, low_intercept, low_r2 = self._fit_trendline(x, low)
+        high_slope, high_intercept, high_r2 = self._fit_trendline(bar_indices, high)
+        low_slope, low_intercept, low_r2 = self._fit_trendline(bar_indices, low)
 
         if high_r2 < 0.3 or low_r2 < 0.3:
             return patterns
@@ -619,7 +619,7 @@ class ChartPatternDetector:
         max_range = float(np.max(high) - np.min(low))
         if max_range <= 0:
             return patterns
-        flat_threshold = max_range * 0.05 / n
+        flat_threshold = max_range * 0.05 / num_bars
 
         high_is_flat = abs(high_slope) < flat_threshold
         low_is_flat = abs(low_slope) < flat_threshold
@@ -643,8 +643,8 @@ class ChartPatternDetector:
         x_apex = (low_intercept - high_intercept) / denom
         apex_price = float(high_slope * x_apex + high_intercept)
 
-        resistance_now = float(high_slope * (n - 1) + high_intercept)
-        support_now = float(low_slope * (n - 1) + low_intercept)
+        resistance_now = float(high_slope * (num_bars - 1) + high_intercept)
+        support_now = float(low_slope * (num_bars - 1) + low_intercept)
         base_width = float(high[0] - low[0])
 
         if direction == "bullish":
@@ -655,7 +655,7 @@ class ChartPatternDetector:
             target = apex_price
 
         # max_range already computed above; reuse it for convergence scoring
-        convergence_ratio = abs(convergence * n) / (max_range + 1e-10)
+        convergence_ratio = abs(convergence * num_bars) / (max_range + 1e-10)
         # Best convergence_ratio ≈ 0.5 (half the range consumed over the window)
         convergence_score = (
             min(convergence_ratio / 0.5, 1.0)
@@ -672,7 +672,7 @@ class ChartPatternDetector:
             direction=direction,
             confidence=confidence,
             start_index=index_offset,
-            end_index=index_offset + n - 1,
+            end_index=index_offset + num_bars - 1,
             key_levels={
                 "resistance": round(resistance_now, 5),
                 "support": round(support_now, 5),
@@ -798,9 +798,9 @@ class ChartPatternDetector:
         if len(consol_close) < 2:
             return []
 
-        x = np.arange(len(consol_close), dtype=float)
-        high_slope, high_intercept, high_r2 = self._fit_trendline(x, consol_high)
-        low_slope, low_intercept, low_r2 = self._fit_trendline(x, consol_low)
+        bar_indices = np.arange(len(consol_close), dtype=float)
+        high_slope, high_intercept, high_r2 = self._fit_trendline(bar_indices, consol_high)
+        low_slope, low_intercept, low_r2 = self._fit_trendline(bar_indices, consol_low)
 
         convergence = high_slope - low_slope
         is_pennant = convergence < 0
@@ -935,12 +935,12 @@ class ChartPatternDetector:
         high = prices["high"].values
         low = prices["low"].values
         close = prices["close"].values
-        n = len(prices)
+        num_bars = len(prices)
 
-        x = np.arange(n, dtype=float)
+        bar_indices = np.arange(num_bars, dtype=float)
 
-        high_slope, high_intercept, high_r2 = self._fit_trendline(x, high)
-        low_slope, low_intercept, low_r2 = self._fit_trendline(x, low)
+        high_slope, high_intercept, high_r2 = self._fit_trendline(bar_indices, high)
+        low_slope, low_intercept, low_r2 = self._fit_trendline(bar_indices, low)
 
         if high_r2 < 0.3 or low_r2 < 0.3:
             return patterns
@@ -968,8 +968,8 @@ class ChartPatternDetector:
             return patterns
 
         price_range = float(np.mean(high) - np.mean(low))
-        resistance_now = float(high_slope * (n - 1) + high_intercept)
-        support_now = float(low_slope * (n - 1) + low_intercept)
+        resistance_now = float(high_slope * (num_bars - 1) + high_intercept)
+        support_now = float(low_slope * (num_bars - 1) + low_intercept)
 
         if both_up:
             ptype = "rising_wedge"
@@ -991,7 +991,7 @@ class ChartPatternDetector:
             direction=direction,
             confidence=confidence,
             start_index=index_offset,
-            end_index=index_offset + n - 1,
+            end_index=index_offset + num_bars - 1,
             key_levels={
                 "resistance": round(resistance_now, 5),
                 "support": round(support_now, 5),
