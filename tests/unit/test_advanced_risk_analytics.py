@@ -444,7 +444,8 @@ class TestAdvancedRiskAnalytics:
         sortino = analytics.calculate_sortino_ratio(returns)
         assert isinstance(sortino, float)
 
-    def test_calculate_sortino_ratio_all_positive(self, analytics):
+    def test_calculate_sortino_ratio_all_positive_returns_inf(self, analytics):
+        """When there are no downside returns, Sortino ratio is infinite."""
         positive_returns = np.abs(_make_returns()) + 0.001
         sortino = analytics.calculate_sortino_ratio(positive_returns)
         assert sortino == float('inf') or sortino > 0

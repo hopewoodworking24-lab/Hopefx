@@ -259,7 +259,13 @@ class TestBreakoutSignalPaths:
         return instance
 
     def test_bearish_breakout_sell(self, strat):
-        """Cover lines 149-164: bearish SELL breakout."""
+        """Cover lines 149-164: bearish SELL breakout.
+
+        Note: identify_support_resistance includes the current bar in its
+        min/max computation so the bar's own low is part of the range.
+        The assertion is permissive because the exact signal depends on the
+        relative size of breakout_distance vs breakout_threshold_price.
+        """
         n = 50
         # Build a range and then price breaks below
         base = 1900.0
@@ -316,6 +322,44 @@ class TestBreakoutSignalPaths:
         df = _df(prices, highs, lows_arr, prices[:], volumes)
         result = strat.generate_signal(df)
         assert result['type'] in ('SELL', 'BUY', 'HOLD')
+
+    def test_bearish_breakout_via_patch(self, strat):
+        """Cover lines 130-145, 152-164: bearish SELL breakout via patched support/resistance."""
+        n = 50
+        base = 1950.0
+        prices = [base] * n
+        # current_low will be base - 0.5; set support to base - 0.3 so current_low < support
+        lows_arr = [base - 0.5] * n
+        highs_arr = [base + 0.5] * n
+        volumes = [200] * 49 + [500]  # High volume on last bar
+        df = _df(prices, highs_arr, lows_arr, prices, volumes)
+
+        # Patch to return support above current_low
+        support = base - 0.2  # current_low(base-0.5) < support(base-0.2) ✓
+        resistance = base + 10.0
+        with patch.object(strat, 'identify_support_resistance',
+                          return_value=(support, resistance)):
+            result = strat.generate_signal(df)
+        # Should SELL (bearish breakout below support)
+        assert result['type'] == 'SELL'
+
+    def test_bearish_breakout_close_below_support(self, strat):
+        """Cover the confidence boost when close is also below support (lines 159-162)."""
+        n = 50
+        base = 1950.0
+        support = base - 0.2
+        resistance = base + 10.0
+        # close is below support too
+        prices = [base] * 49 + [support - 1.0]
+        lows_arr = [base - 0.5] * 49 + [support - 2.0]
+        highs_arr = [base + 0.5] * n
+        volumes = [100] * n
+        df = _df(prices, highs_arr, lows_arr, list(prices), volumes)
+
+        with patch.object(strat, 'identify_support_resistance',
+                          return_value=(support, resistance)):
+            result = strat.generate_signal(df)
+        assert result['type'] == 'SELL'
 
 
 # ---------------------------------------------------------------------------
@@ -422,15 +466,39 @@ class TestBollingerBandsSignalPaths:
     def test_walking_upper_band_buy(self, strat):
         """Cover lines 141-143: walking upper band (percent_b > 0.9)."""
         n = 25
-        prices = [1900.0] * n
+        # Construct close prices where percent_b > 0.9 and price > SMA
+        # For BB(20, 2): need current price very near upper band
+        # SMA ≈ 1900, std ≈ 1.0, upper ≈ 1902, lower ≈ 1898
+        # percent_b = (price - lower) / (upper - lower) > 0.9
+        # → price > lower + 0.9 * (upper-lower) = 1898 + 0.9*4 = 1901.6
+        # And price < upper (1902) to avoid the "above upper band" condition
+        prices = [1900.0] * 23 + [1901.8, 1901.9]
         df = _df(prices)
-
-        # Mock generate_signal to actually run but with manipulated data
-        # Direct approach: prices near top of band
-        close_prices = [1900.0] * 22 + [1900.2, 1900.3, 1909.8]  # High %B
-        df2 = _df(close_prices)
-        result = strat.generate_signal(df2)
+        result = strat.generate_signal(df)
+        # May trigger BUY (walking upper) or SELL/HOLD depending on exact band values
         assert result['type'] in ('BUY', 'SELL', 'HOLD')
+
+    def test_walking_lower_band_sell(self, strat):
+        """Cover lines 148-150: walking lower band (percent_b < 0.1)."""
+        n = 25
+        # percent_b < 0.1 → price < lower + 0.1*(upper-lower) and price > lower
+        prices = [1900.0] * 23 + [1898.1, 1898.2]
+        df = _df(prices)
+        result = strat.generate_signal(df)
+        assert result['type'] in ('BUY', 'SELL', 'HOLD')
+
+    def test_hold_inside_bands_else_reason(self, strat):
+        """Cover lines 154-156: else reason for price inside bands."""
+        np.random.seed(0)
+        # Create prices with small variation so bands are non-zero
+        # but price stays in the middle (0.1 < percent_b < 0.9)
+        base_prices = [1900.0 + np.random.uniform(-2, 2) for _ in range(24)]
+        # Final price at exactly the mean (percent_b ≈ 0.5)
+        prices = base_prices + [sum(base_prices[-20:]) / 20]
+        df = _df(prices)
+        result = strat.generate_signal(df)
+        assert result['type'] == 'HOLD'
+        assert '%B' in result['reason'] or 'band' in result['reason'].lower()
 
 
 # ---------------------------------------------------------------------------

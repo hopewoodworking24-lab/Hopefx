@@ -430,18 +430,9 @@ class TestAlertEngineExtended:
         assert len(triggered) == 0
 
     def test_check_alerts_price_range_no_threshold_2(self, engine):
-        """Test range condition without threshold_2."""
-        from notifications.alert_engine import AlertConditionType, AlertCondition
-        # Directly test _evaluate_condition with None threshold_2
-        engine2 = engine
-        from notifications.alert_engine import AlertEngine
-        condition = AlertCondition(
-            type=AlertConditionType.PRICE_INSIDE_RANGE,
-            threshold=1900.0,
-            threshold_2=None
-        )
-        # Create dummy alert to test
-        alert = engine2.create_alert(
+        """Test range condition without threshold_2 does not trigger."""
+        from notifications.alert_engine import AlertConditionType
+        alert = engine.create_alert(
             name='Range No Threshold2',
             symbol='XAUUSD',
             condition_type=AlertConditionType.PRICE_INSIDE_RANGE,
@@ -457,7 +448,7 @@ class TestAlertEngineExtended:
             }
         }
         # With no threshold_2, should not trigger
-        triggered = engine2.check_alerts(market_data)
+        triggered = engine.check_alerts(market_data)
         assert len(triggered) == 0
 
     # --- Notification handler ---

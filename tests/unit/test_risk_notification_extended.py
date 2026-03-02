@@ -262,8 +262,7 @@ class TestNotificationManagerExtended:
         from notifications.manager import NotificationLevel, NotificationChannel
         with caplog.at_level(logging.INFO):
             mgr._send_console('Test info message', NotificationLevel.INFO)
-        assert any('NOTIFICATION' in r.message or 'Test info' in r.message
-                   for r in caplog.records) or True  # Just verify no exception
+        # Just verify the method runs without exception; log may go to different logger
 
     def test_send_console_warning(self, mgr, caplog):
         from notifications.manager import NotificationLevel
@@ -334,19 +333,21 @@ class TestNotificationManagerExtended:
         with patch('requests.post', side_effect=ImportError("no requests")):
             with patch('urllib.request.urlopen') as mock_urlopen:
                 mock_urlopen.return_value = MagicMock()
+                # Should not raise; either uses urllib fallback or logs an error
                 try:
                     mgr._send_discord('Test', NotificationLevel.INFO, None)
                 except Exception:
-                    pass  # Some failure modes are acceptable
+                    pass  # Error logging is acceptable for this code path
 
-    def test_send_discord_http_scheme_rejected(self, mgr):
+    def test_send_discord_http_scheme_rejected(self, mgr, caplog):
         """Discord webhook with http (non-https) should be rejected."""
         from notifications.manager import NotificationLevel
         mgr.config['discord_webhook_url'] = 'http://discord.com/api/webhooks/test'
         with patch('requests.post', side_effect=ImportError("no requests")):
             with patch('urllib.request.urlopen') as mock_urlopen:
-                # Should not be called since http is rejected
-                mgr._send_discord('Test', NotificationLevel.INFO, None)
+                with caplog.at_level(logging.ERROR):
+                    mgr._send_discord('Test', NotificationLevel.INFO, None)
+                # urlopen must NOT be called because http scheme is rejected
                 mock_urlopen.assert_not_called()
 
     def test_notify_error_handling(self, mgr):
