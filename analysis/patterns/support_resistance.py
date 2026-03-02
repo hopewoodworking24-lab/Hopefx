@@ -786,7 +786,7 @@ class SupportResistanceDetector:
             touch_count=total_touches,
             last_touch=latest_touch,
             method=method_str,
-            is_active=all(lv.is_active for lv in group),
+            is_active=any(lv.is_active for lv in group),  # active if any constituent is active
             description="; ".join(lv.description for lv in group if lv.description),
         )
 

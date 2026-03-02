@@ -147,7 +147,7 @@ class ChartPatternDetector:
         # Lock for thread-safe access to any mutable state
         self._lock = threading.Lock()
 
-        logger.info("Chart Pattern Detector initialized")
+        logger.info("Chart Pattern Detector initialized (config=%s)", self.config)
 
     # ================================================================
     # PUBLIC API
