@@ -1,528 +1,356 @@
 """
-Comprehensive Tests for Real-Time Streaming Service Module
-
-Tests for:
-- TickData, TradeData, OrderBookData dataclasses
-- ConnectionStatus dataclass
-- StreamingService (subscribe/unsubscribe, publish, callbacks,
-  connection status, buffer access)
-- MockDataSource (basic functionality, price access)
-
-No real network connections are made – all data is injected directly.
+Tests for Real-Time Streaming Service (data/streaming.py)
 """
 
-import time
 import pytest
-from datetime import datetime, timezone
-from unittest.mock import MagicMock
+from datetime import datetime, timedelta
 
 
-# ---------------------------------------------------------------------------
-# TickData tests
-# ---------------------------------------------------------------------------
+class TestTick:
+    """Tests for Tick dataclass."""
 
+    def test_tick_creation(self):
+        from data.streaming import Tick
 
-class TestTickData:
-    """Tests for TickData dataclass."""
-
-    def test_creation(self):
-        """Test creating a TickData."""
-        from data.streaming import TickData
-
-        tick = TickData(
-            timestamp=datetime.now(timezone.utc),
+        tick = Tick(
             symbol="XAUUSD",
-            bid=2330.0,
-            ask=2330.5,
-            bid_size=1.0,
-            ask_size=1.0,
+            timestamp=datetime.utcnow(),
+            bid=1950.0,
+            ask=1950.1,
+            last=1950.05,
+            volume=100.0,
         )
 
         assert tick.symbol == "XAUUSD"
-        assert tick.bid == 2330.0
-        assert tick.ask == 2330.5
+        assert tick.bid == 1950.0
+        assert tick.ask == 1950.1
 
-    def test_spread(self):
-        """Test spread calculation."""
-        from data.streaming import TickData
+    def test_tick_mid(self):
+        from data.streaming import Tick
 
-        tick = TickData(
-            datetime.now(timezone.utc), "XAUUSD", 2330.0, 2330.5, 1.0, 1.0
+        tick = Tick(
+            symbol="XAUUSD",
+            timestamp=datetime.utcnow(),
+            bid=1950.0,
+            ask=1950.1,
+            last=1950.05,
         )
-        assert tick.spread == pytest.approx(0.5)
 
-    def test_mid_price(self):
-        """Test mid-price calculation."""
-        from data.streaming import TickData
+        assert tick.mid == pytest.approx(1950.05, rel=1e-5)
 
-        tick = TickData(
-            datetime.now(timezone.utc), "XAUUSD", 2330.0, 2331.0, 1.0, 1.0
+    def test_tick_spread(self):
+        from data.streaming import Tick
+
+        tick = Tick(
+            symbol="XAUUSD",
+            timestamp=datetime.utcnow(),
+            bid=1950.0,
+            ask=1950.1,
+            last=1950.05,
         )
-        assert tick.mid_price == pytest.approx(2330.5)
 
-    def test_to_dict(self):
-        """Test serialisation."""
-        from data.streaming import TickData
+        assert tick.spread == pytest.approx(0.1, rel=1e-5)
 
-        tick = TickData(
-            datetime.now(timezone.utc), "XAUUSD", 2330.0, 2330.5, 1.0, 1.0,
-            last_price=2330.2
+    def test_tick_to_dict(self):
+        from data.streaming import Tick
+
+        tick = Tick(
+            symbol="XAUUSD",
+            timestamp=datetime.utcnow(),
+            bid=1950.0,
+            ask=1950.1,
+            last=1950.05,
+            volume=50.0,
         )
+
         d = tick.to_dict()
-
         assert d["symbol"] == "XAUUSD"
+        assert "mid" in d
         assert "spread" in d
-        assert "mid_price" in d
-        assert d["last_price"] == 2330.2
 
 
-class TestTradeData:
-    """Tests for TradeData dataclass."""
+class TestAggregatedBar:
+    """Tests for AggregatedBar dataclass."""
 
-    def test_creation_and_dict(self):
-        """Test TradeData creation and serialisation."""
-        from data.streaming import TradeData
+    def test_bar_to_dict(self):
+        from data.streaming import AggregatedBar
 
-        trade = TradeData(
-            timestamp=datetime.now(timezone.utc),
+        bar = AggregatedBar(
             symbol="XAUUSD",
-            price=2330.25,
-            size=0.5,
-            side="buy",
-            trade_id="T123",
+            timeframe="1m",
+            timestamp=datetime.utcnow(),
+            open=1950.0,
+            high=1951.0,
+            low=1949.5,
+            close=1950.5,
+            volume=1000.0,
+            tick_count=20,
         )
 
-        assert trade.side == "buy"
-        d = trade.to_dict()
-        assert d["price"] == 2330.25
-        assert d["trade_id"] == "T123"
-
-
-class TestOrderBookData:
-    """Tests for OrderBookData dataclass."""
-
-    def test_best_bid_ask(self):
-        """Test best_bid and best_ask properties."""
-        from data.streaming import OrderBookData
-
-        ob = OrderBookData(
-            timestamp=datetime.now(timezone.utc),
-            symbol="XAUUSD",
-            bids=[[2330.0, 1.0], [2329.9, 2.0]],
-            asks=[[2330.5, 1.0], [2330.6, 2.0]],
-        )
-
-        assert ob.best_bid == 2330.0
-        assert ob.best_ask == 2330.5
-
-    def test_empty_book_returns_none(self):
-        """Test None when order book sides are empty."""
-        from data.streaming import OrderBookData
-
-        ob = OrderBookData(
-            datetime.now(timezone.utc), "XAUUSD", [], []
-        )
-        assert ob.best_bid is None
-        assert ob.best_ask is None
-
-    def test_to_dict(self):
-        """Test serialisation."""
-        from data.streaming import OrderBookData
-
-        ob = OrderBookData(
-            datetime.now(timezone.utc), "XAUUSD",
-            bids=[[2330.0, 1.0]], asks=[[2330.5, 1.0]],
-            is_snapshot=True, sequence=42,
-        )
-        d = ob.to_dict()
-
+        d = bar.to_dict()
         assert d["symbol"] == "XAUUSD"
-        assert d["sequence"] == 42
-        assert d["best_bid"] == 2330.0
+        assert d["timeframe"] == "1m"
+        assert d["high"] == 1951.0
 
 
-class TestConnectionStatus:
-    """Tests for ConnectionStatus dataclass."""
+class TestTickAggregator:
+    """Tests for TickAggregator."""
 
-    def test_default_state(self):
-        """Test ConnectionStatus defaults to DISCONNECTED."""
-        from data.streaming import ConnectionStatus, ConnectionState
+    def test_initialization(self):
+        from data.streaming import TickAggregator
 
-        status = ConnectionStatus()
-        assert status.state == ConnectionState.DISCONNECTED
-        assert status.messages_received == 0
+        agg = TickAggregator(timeframe_minutes=1)
+        assert agg is not None
 
-    def test_to_dict(self):
-        """Test serialisation."""
-        from data.streaming import ConnectionStatus, ConnectionState
+    def test_no_bar_on_first_tick(self):
+        from data.streaming import Tick, TickAggregator
 
-        status = ConnectionStatus(state=ConnectionState.CONNECTED, messages_received=5)
-        d = status.to_dict()
+        agg = TickAggregator(1)
+        tick = Tick("XAUUSD", datetime.utcnow(), 1950.0, 1950.1, 1950.05)
 
-        assert d["state"] == "connected"
-        assert d["messages_received"] == 5
+        bar = agg.add_tick(tick)
+        assert bar is None  # No completed bar yet
+
+    def test_bar_completes_on_period_change(self):
+        from data.streaming import Tick, TickAggregator
+
+        agg = TickAggregator(1)
+
+        # Tick in minute 0
+        ts0 = datetime(2024, 1, 1, 10, 0, 30)
+        agg.add_tick(Tick("XAUUSD", ts0, 1950.0, 1950.1, 1950.0, volume=100.0))
+
+        # Tick in minute 1 - should close minute 0's bar
+        ts1 = datetime(2024, 1, 1, 10, 1, 0)
+        bar = agg.add_tick(Tick("XAUUSD", ts1, 1951.0, 1951.1, 1951.0, volume=50.0))
+
+        assert bar is not None
+        assert bar.symbol == "XAUUSD"
+        assert bar.close == 1950.0
+        assert bar.volume == 100.0
+
+    def test_ohlc_tracking(self):
+        from data.streaming import Tick, TickAggregator
+
+        agg = TickAggregator(1)
+        ts_base = datetime(2024, 1, 1, 10, 0, 0)
+
+        prices_vols = [
+            (1950.0, 100.0),
+            (1952.0, 50.0),
+            (1948.0, 75.0),
+            (1951.0, 30.0),
+        ]
+        for price, vol in prices_vols:
+            agg.add_tick(Tick("XAUUSD", ts_base, 1950.0, price + 0.1, price, volume=vol))
+            ts_base = ts_base.replace(second=ts_base.second + 10)
+
+        # Close the bar with a tick in next minute
+        ts_next = datetime(2024, 1, 1, 10, 1, 0)
+        bar = agg.add_tick(Tick("XAUUSD", ts_next, 1950.0, 1950.1, 1950.0))
+
+        assert bar is not None
+        assert bar.high == 1952.0
+        assert bar.low == 1948.0
+        assert bar.open == 1950.0
+
+    def test_get_open_bar(self):
+        from data.streaming import Tick, TickAggregator
+
+        agg = TickAggregator(1)
+        tick = Tick("XAUUSD", datetime.utcnow(), 1950.0, 1950.1, 1950.05)
+        agg.add_tick(tick)
+
+        open_bar = agg.get_open_bar("XAUUSD")
+        assert open_bar is not None
+        assert open_bar["open"] == 1950.05
 
 
-# ---------------------------------------------------------------------------
-# StreamingService tests
-# ---------------------------------------------------------------------------
+class TestStreamingService:
+    """Tests for StreamingService."""
 
-
-class TestStreamingServiceInit:
-    """Tests for StreamingService initialisation."""
-
-    def test_default_init(self):
-        """Test default initialisation."""
+    def test_initialization(self):
         from data.streaming import StreamingService
 
-        svc = StreamingService()
-        assert svc is not None
+        service = StreamingService()
+        assert service is not None
 
-    def test_init_with_config(self):
-        """Test initialisation with StreamConfig."""
-        from data.streaming import StreamingService, StreamConfig
+    def test_connect_disconnect(self):
+        from data.streaming import StreamingService, StreamStatus
 
-        config = StreamConfig(symbols=["XAUUSD"], throttle_ms=50)
-        svc = StreamingService(config)
+        service = StreamingService()
+        service.connect()
+        assert service.status == StreamStatus.CONNECTED
 
-        subs = svc.get_subscribed_symbols()
-        assert "XAUUSD" in subs
+        service.disconnect()
+        assert service.status == StreamStatus.DISCONNECTED
 
-    def test_initial_status_disconnected(self):
-        """Test initial connection state is DISCONNECTED."""
-        from data.streaming import StreamingService, ConnectionState
-
-        svc = StreamingService()
-        status = svc.get_connection_status()
-        assert status["state"] == ConnectionState.DISCONNECTED.value
-
-
-class TestStreamingServiceSubscriptions:
-    """Tests for subscribe/unsubscribe."""
-
-    def test_subscribe_adds_symbol(self):
-        """Test that subscribing adds symbol to subscriptions."""
+    def test_subscribe_unsubscribe(self):
         from data.streaming import StreamingService
 
-        svc = StreamingService()
-        svc.subscribe("EURUSD")
+        service = StreamingService()
+        events = []
 
-        subs = svc.get_subscribed_symbols()
-        assert "EURUSD" in subs
+        def handler(event):
+            events.append(event)
 
-    def test_subscribe_specific_data_types(self):
-        """Test subscribing to specific data types."""
+        service.subscribe("XAUUSD", handler)
+        assert "XAUUSD" in service.get_subscriptions()
+
+        service.unsubscribe("XAUUSD", handler)
+
+    def test_publish_tick_dispatches_event(self):
+        from data.streaming import StreamingService, Tick
+
+        service = StreamingService()
+        events = []
+        service.subscribe("XAUUSD", events.append)
+
+        tick = Tick("XAUUSD", datetime.utcnow(), 1950.0, 1950.1, 1950.05, volume=100.0)
+        service.publish_tick(tick)
+
+        assert len(events) == 1
+        assert events[0].event_type == "tick"
+
+    def test_global_listener_receives_all(self):
+        from data.streaming import StreamingService, Tick
+
+        service = StreamingService()
+        all_events = []
+        service.subscribe("*", all_events.append)
+
+        service.publish_tick(Tick("XAUUSD", datetime.utcnow(), 1950.0, 1950.1, 1950.05))
+        service.publish_tick(Tick("EURUSD", datetime.utcnow(), 1.08, 1.0801, 1.0800))
+
+        # At least one tick event per symbol
+        tick_events = [e for e in all_events if e.event_type == "tick"]
+        assert len(tick_events) == 2
+
+    def test_get_recent_ticks(self):
+        from data.streaming import StreamingService, Tick
+
+        service = StreamingService()
+        for i in range(20):
+            service.publish_tick(
+                Tick("XAUUSD", datetime.utcnow(), 1950.0, 1950.1, 1950.0 + i)
+            )
+
+        ticks = service.get_recent_ticks("XAUUSD", n=5)
+        assert len(ticks) == 5
+
+    def test_get_recent_ticks_empty(self):
         from data.streaming import StreamingService
 
-        svc = StreamingService()
-        svc.subscribe("XAUUSD", data_types=["tick"])
+        service = StreamingService()
+        assert service.get_recent_ticks("NONEXISTENT") == []
 
-        subs = svc.get_subscribed_symbols()
-        assert "tick" in subs["XAUUSD"]
-        assert "trade" not in subs["XAUUSD"]
+    def test_get_latest_tick(self):
+        from data.streaming import StreamingService, Tick
 
-    def test_subscribe_invalid_type_raises(self):
-        """Test that an invalid data type raises ValueError."""
+        service = StreamingService()
+        service.publish_tick(Tick("XAUUSD", datetime.utcnow(), 1950.0, 1950.1, 1950.0))
+        service.publish_tick(Tick("XAUUSD", datetime.utcnow(), 1951.0, 1951.1, 1951.0))
+
+        latest = service.get_latest_tick("XAUUSD")
+        assert latest is not None
+        assert latest.last == 1951.0
+
+    def test_get_latest_tick_empty(self):
         from data.streaming import StreamingService
 
-        svc = StreamingService()
-        with pytest.raises(ValueError):
-            svc.subscribe("XAUUSD", data_types=["invalid_type"])
+        service = StreamingService()
+        assert service.get_latest_tick("NONEXISTENT") is None
 
-    def test_unsubscribe_removes_symbol(self):
-        """Test that unsubscribing removes symbol completely."""
+    def test_bar_aggregation(self):
+        from data.streaming import StreamingService, Tick
+
+        service = StreamingService(config={"default_timeframes": [1]})
+        bars_received = []
+        service.subscribe("XAUUSD", lambda e: bars_received.append(e) if e.event_type == "bar" else None)
+
+        # Minute 0
+        ts0 = datetime(2024, 1, 1, 10, 0, 30)
+        service.publish_tick(Tick("XAUUSD", ts0, 1950.0, 1950.1, 1950.05, volume=100.0))
+
+        # Minute 1 - should trigger bar close
+        ts1 = datetime(2024, 1, 1, 10, 1, 0)
+        service.publish_tick(Tick("XAUUSD", ts1, 1951.0, 1951.1, 1951.05, volume=50.0))
+
+        assert len(bars_received) == 1
+        bar_data = bars_received[0].data
+        assert bar_data["volume"] == 100.0
+
+    def test_get_bars(self):
+        from data.streaming import StreamingService, Tick
+
+        service = StreamingService(config={"default_timeframes": [1]})
+
+        # Minute 0
+        ts0 = datetime(2024, 1, 1, 10, 0, 30)
+        service.publish_tick(Tick("XAUUSD", ts0, 1950.0, 1950.1, 1950.05, volume=100.0))
+
+        # Minute 1
+        ts1 = datetime(2024, 1, 1, 10, 1, 0)
+        service.publish_tick(Tick("XAUUSD", ts1, 1951.0, 1951.1, 1951.05, volume=50.0))
+
+        bars = service.get_bars("XAUUSD", timeframe="1m")
+        assert len(bars) == 1
+
+    def test_clear_symbol(self):
+        from data.streaming import StreamingService, Tick
+
+        service = StreamingService()
+        service.publish_tick(Tick("XAUUSD", datetime.utcnow(), 1950.0, 1950.1, 1950.05))
+        service.clear_symbol("XAUUSD")
+
+        assert service.get_recent_ticks("XAUUSD") == []
+
+    def test_clear_all(self):
+        from data.streaming import StreamingService, Tick
+
+        service = StreamingService()
+        service.publish_tick(Tick("XAUUSD", datetime.utcnow(), 1950.0, 1950.1, 1950.05))
+        service.publish_tick(Tick("EURUSD", datetime.utcnow(), 1.08, 1.0801, 1.08))
+        service.clear_all()
+
+        assert service.get_recent_ticks("XAUUSD") == []
+        assert service.get_recent_ticks("EURUSD") == []
+
+    def test_get_stats(self):
         from data.streaming import StreamingService
 
-        svc = StreamingService()
-        svc.subscribe("XAUUSD")
-        svc.unsubscribe("XAUUSD")
+        service = StreamingService()
+        stats = service.get_stats()
 
-        subs = svc.get_subscribed_symbols()
-        assert "XAUUSD" not in subs
+        assert "status" in stats
+        assert "subscribed_symbols" in stats
+        assert "available_timeframes" in stats
 
-    def test_unsubscribe_clears_buffers(self):
-        """Test that buffers are cleared on unsubscribe."""
-        from data.streaming import StreamingService, TickData
-
-        svc = StreamingService()
-        svc.subscribe("XAUUSD", data_types=["tick"])
-
-        tick = TickData(
-            datetime.now(timezone.utc), "XAUUSD", 2330.0, 2330.5, 1.0, 1.0
-        )
-        svc.publish_tick(tick)
-
-        svc.unsubscribe("XAUUSD")
-        # After unsubscribe, get_tick_buffer should return empty (symbol removed)
-        assert svc.get_tick_buffer("XAUUSD") == []
-
-
-class TestStreamingServiceCallbacks:
-    """Tests for callback registration and invocation."""
-
-    def _make_subscribed_service(self, symbol="XAUUSD"):
-        from data.streaming import StreamingService, StreamConfig
-        config = StreamConfig(symbols=[symbol], throttle_ms=0)
-        return StreamingService(config)
-
-    def test_on_tick_callback_called(self):
-        """Test that registered tick callbacks are invoked on publish."""
-        from data.streaming import TickData
-
-        svc = self._make_subscribed_service()
-        received = []
-        svc.on_tick(received.append)
-
-        tick = TickData(
-            datetime.now(timezone.utc), "XAUUSD", 2330.0, 2330.5, 1.0, 1.0
-        )
-        svc.publish_tick(tick)
-
-        assert len(received) == 1
-        assert received[0].symbol == "XAUUSD"
-
-    def test_on_trade_callback_called(self):
-        """Test that trade callbacks are invoked on publish."""
-        from data.streaming import TradeData
-
-        svc = self._make_subscribed_service()
-        received = []
-        svc.on_trade(received.append)
-
-        trade = TradeData(
-            datetime.now(timezone.utc), "XAUUSD", 2330.25, 0.5, "buy"
-        )
-        svc.publish_trade(trade)
-
-        assert len(received) == 1
-        assert received[0].price == 2330.25
-
-    def test_on_orderbook_callback_called(self):
-        """Test that order book callbacks are invoked on publish."""
-        from data.streaming import OrderBookData
-
-        svc = self._make_subscribed_service()
-        received = []
-        svc.on_orderbook(received.append)
-
-        ob = OrderBookData(
-            datetime.now(timezone.utc), "XAUUSD",
-            bids=[[2330.0, 1.0]], asks=[[2330.5, 1.0]]
-        )
-        svc.publish_orderbook(ob)
-
-        assert len(received) == 1
-
-    def test_on_tick_decorator_style(self):
-        """Test on_tick used as a decorator returns the original callback."""
+    def test_reconnect_with_backoff_success(self):
         from data.streaming import StreamingService
 
-        svc = StreamingService()
-        callback = MagicMock()
+        service = StreamingService(config={"reconnect_base_delay": 0})
+        call_count = [0]
 
-        returned = svc.on_tick(callback)
-        assert returned is callback
+        def mock_connect():
+            call_count[0] += 1
+            return call_count[0] >= 2  # Succeed on second attempt
 
-    def test_remove_tick_callback(self):
-        """Test that removed callbacks are no longer invoked."""
-        from data.streaming import TickData
+        result = service.reconnect_with_backoff(mock_connect, max_attempts=3)
+        assert result is True
 
-        svc = self._make_subscribed_service()
-        received = []
-        svc.on_tick(received.append)
+    def test_reconnect_with_backoff_failure(self):
+        from data.streaming import StreamingService, StreamStatus
 
-        svc.remove_tick_callback(received.append)
+        service = StreamingService(config={"reconnect_base_delay": 0})
 
-        tick = TickData(
-            datetime.now(timezone.utc), "XAUUSD", 2330.0, 2330.5, 1.0, 1.0
-        )
-        svc.publish_tick(tick)
+        result = service.reconnect_with_backoff(lambda: False, max_attempts=2)
+        assert result is False
+        assert service.status == StreamStatus.ERROR
 
-        assert len(received) == 0
+    def test_global_instance(self):
+        from data.streaming import get_streaming_service
 
-    def test_remove_nonexistent_callback_no_error(self):
-        """Test removing a callback that is not registered is a no-op."""
-        from data.streaming import StreamingService
-
-        svc = StreamingService()
-        cb = MagicMock()
-        svc.remove_tick_callback(cb)  # should not raise
-
-
-class TestStreamingServicePublish:
-    """Tests for publish_tick / publish_trade / publish_orderbook."""
-
-    def _make_svc(self, symbol="XAUUSD"):
-        from data.streaming import StreamingService, StreamConfig
-        config = StreamConfig(symbols=[symbol], throttle_ms=0)
-        return StreamingService(config)
-
-    def test_publish_tick_ignored_for_unsubscribed_symbol(self):
-        """Test that ticks for unsubscribed symbols are silently ignored."""
-        from data.streaming import TickData
-
-        svc = self._make_svc("XAUUSD")
-        received = []
-        svc.on_tick(received.append)
-
-        # Publish for a symbol we never subscribed to
-        tick = TickData(
-            datetime.now(timezone.utc), "EURUSD", 1.08, 1.0801, 1.0, 1.0
-        )
-        svc.publish_tick(tick)
-
-        assert received == []
-
-    def test_publish_tick_stored_in_buffer(self):
-        """Test that published ticks are stored in the tick buffer."""
-        from data.streaming import TickData
-
-        svc = self._make_svc()
-        tick = TickData(
-            datetime.now(timezone.utc), "XAUUSD", 2330.0, 2330.5, 1.0, 1.0
-        )
-        svc.publish_tick(tick)
-
-        buf = svc.get_tick_buffer("XAUUSD")
-        assert len(buf) >= 1
-
-    def test_publish_trade_stored_in_buffer(self):
-        """Test that published trades are stored in the trade buffer."""
-        from data.streaming import TradeData
-
-        svc = self._make_svc()
-        trade = TradeData(
-            datetime.now(timezone.utc), "XAUUSD", 2330.25, 0.5, "buy"
-        )
-        svc.publish_trade(trade)
-
-        buf = svc.get_trade_buffer("XAUUSD")
-        assert len(buf) >= 1
-
-    def test_publish_orderbook_stored_in_buffer(self):
-        """Test that published order books are stored in the buffer."""
-        from data.streaming import OrderBookData
-
-        svc = self._make_svc()
-        ob = OrderBookData(
-            datetime.now(timezone.utc), "XAUUSD",
-            bids=[[2330.0, 1.0]], asks=[[2330.5, 1.0]]
-        )
-        svc.publish_orderbook(ob)
-
-        buf = svc.get_orderbook_buffer("XAUUSD")
-        assert len(buf) >= 1
-
-    def test_messages_received_increments(self):
-        """Test messages_received counter increments on publish."""
-        from data.streaming import TickData
-
-        svc = self._make_svc()
-        initial = svc.get_connection_status()["messages_received"]
-
-        tick = TickData(
-            datetime.now(timezone.utc), "XAUUSD", 2330.0, 2330.5, 1.0, 1.0
-        )
-        svc.publish_tick(tick)
-
-        assert svc.get_connection_status()["messages_received"] == initial + 1
-
-
-class TestStreamingServiceBufferAccess:
-    """Tests for get_tick_buffer, get_trade_buffer, get_orderbook_buffer."""
-
-    def test_empty_buffer_for_unknown_symbol(self):
-        """Test empty list returned for unknown symbol buffers."""
-        from data.streaming import StreamingService
-
-        svc = StreamingService()
-        assert svc.get_tick_buffer("UNKNOWN") == []
-        assert svc.get_trade_buffer("UNKNOWN") == []
-        assert svc.get_orderbook_buffer("UNKNOWN") == []
-
-    def test_buffer_returns_snapshot(self):
-        """Test that buffer accessor returns a list (not a deque)."""
-        from data.streaming import StreamingService, StreamConfig, TickData
-
-        config = StreamConfig(symbols=["XAUUSD"], throttle_ms=0)
-        svc = StreamingService(config)
-
-        tick = TickData(
-            datetime.now(timezone.utc), "XAUUSD", 2330.0, 2330.5, 1.0, 1.0
-        )
-        svc.publish_tick(tick)
-
-        result = svc.get_tick_buffer("XAUUSD")
-        assert isinstance(result, list)
-
-
-# ---------------------------------------------------------------------------
-# MockDataSource tests
-# ---------------------------------------------------------------------------
-
-
-class TestMockDataSource:
-    """Tests for MockDataSource basic functionality."""
-
-    def _make_service_and_source(self, symbol="XAUUSD"):
-        from data.streaming import StreamingService, StreamConfig, MockDataSource
-
-        config = StreamConfig(symbols=[symbol], throttle_ms=0)
-        svc = StreamingService(config)
-        src = MockDataSource(svc, symbols=[symbol], tick_interval_ms=50)
-        return svc, src
-
-    def test_get_current_price_returns_seed(self):
-        """Test get_current_price returns the seed price for known symbol."""
-        from data.streaming import StreamingService, StreamConfig, MockDataSource
-
-        config = StreamConfig(symbols=["XAUUSD"], throttle_ms=0)
-        svc = StreamingService(config)
-        src = MockDataSource(svc, symbols=["XAUUSD"])
-
-        price = src.get_current_price("XAUUSD")
-        assert price is not None
-        assert price > 0
-
-    def test_get_current_price_none_for_unknown(self):
-        """Test None returned for unknown symbol."""
-        from data.streaming import StreamingService, MockDataSource
-
-        svc = StreamingService()
-        src = MockDataSource(svc, symbols=["XAUUSD"])
-
-        assert src.get_current_price("UNKNOWN") is None
-
-    def test_start_stop_lifecycle(self):
-        """Test that start/stop lifecycle works without errors."""
-        svc, src = self._make_service_and_source()
-        src.start()
-        assert src._running is True
-        time.sleep(0.2)
-        src.stop()
-        assert src._running is False
-
-    def test_start_idempotent(self):
-        """Test that calling start() twice does not raise."""
-        svc, src = self._make_service_and_source()
-        src.start()
-        src.start()  # second call should be a no-op
-        src.stop()
-
-    def test_data_published_after_start(self):
-        """Test that ticks are published after source starts."""
-        from data.streaming import StreamConfig, StreamingService, MockDataSource
-
-        config = StreamConfig(symbols=["XAUUSD"], throttle_ms=0)
-        svc = StreamingService(config)
-        src = MockDataSource(svc, symbols=["XAUUSD"], tick_interval_ms=20)
-
-        received = []
-        svc.on_tick(received.append)
-
-        src.start()
-        time.sleep(0.3)
-        src.stop()
-
-        assert len(received) > 0
-        assert received[0].symbol == "XAUUSD"
+        s1 = get_streaming_service()
+        s2 = get_streaming_service()
+        assert s1 is s2
