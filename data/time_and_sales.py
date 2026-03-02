@@ -17,7 +17,7 @@ import logging
 import threading
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Tuple, Any
 
 logger = logging.getLogger(__name__)
@@ -85,7 +85,7 @@ class TradeVelocity:
     sell_trades_pct: float  # 0–100
     total_trades: int
     total_volume: float
-    calculated_at: datetime = field(default_factory=datetime.utcnow)
+    calculated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def to_dict(self) -> Dict:
         """Serialise to plain dictionary."""
@@ -119,7 +119,7 @@ class AggressorStats:
     sell_volume_pct: float
     net_delta: float          # buy_volume - sell_volume
     dominant_side: str        # 'buyers', 'sellers', 'neutral'
-    calculated_at: datetime = field(default_factory=datetime.utcnow)
+    calculated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def to_dict(self) -> Dict:
         """Serialise to plain dictionary."""
@@ -319,7 +319,7 @@ class TimeAndSalesService:
             price: Executed price.
             size: Executed size / quantity.
             side: Aggressor side – ``"buy"`` or ``"sell"``.
-            timestamp: UTC trade timestamp.  Defaults to ``datetime.utcnow()``.
+            timestamp: UTC trade timestamp.  Defaults to ``datetime.now(timezone.utc)``.
             trade_id: Optional broker-assigned trade identifier.
 
         Returns:
@@ -340,7 +340,7 @@ class TimeAndSalesService:
         is_large = size >= threshold
 
         trade = ExecutedTrade(
-            timestamp=timestamp or datetime.utcnow(),
+            timestamp=timestamp or datetime.now(timezone.utc),
             symbol=symbol,
             price=price,
             size=size,
@@ -484,7 +484,7 @@ class TimeAndSalesService:
             snapshot = list(tape)
 
         if lookback_minutes is not None:
-            cutoff = datetime.utcnow() - timedelta(minutes=lookback_minutes)
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
             snapshot = [t for t in snapshot if t.timestamp >= cutoff]
 
         return [t for t in snapshot if t.size >= threshold]
@@ -506,7 +506,7 @@ class TimeAndSalesService:
         Returns:
             :class:`TradeVelocity` or ``None`` when no trades exist.
         """
-        cutoff = datetime.utcnow() - timedelta(minutes=window_minutes)
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
 
         with self._lock:
             tape = self._tapes.get(symbol)
@@ -526,7 +526,7 @@ class TimeAndSalesService:
         # Effective elapsed time: use actual span if ≥1 s, else window_minutes
         earliest = min(t.timestamp for t in window_trades)
         elapsed_minutes = max(
-            (datetime.utcnow() - earliest).total_seconds() / 60.0,
+            (datetime.now(timezone.utc) - earliest).total_seconds() / 60.0,
             1.0 / 60.0,  # floor at one second
         )
 
@@ -555,7 +555,7 @@ class TimeAndSalesService:
         Returns:
             :class:`AggressorStats` or ``None`` when no trades exist.
         """
-        cutoff = datetime.utcnow() - timedelta(minutes=lookback_minutes)
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
 
         with self._lock:
             tape = self._tapes.get(symbol)
@@ -631,7 +631,7 @@ class TimeAndSalesService:
             snapshot = list(tape)
 
         if lookback_minutes is not None:
-            cutoff = datetime.utcnow() - timedelta(minutes=lookback_minutes)
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
             snapshot = [t for t in snapshot if t.timestamp >= cutoff]
 
         if not snapshot:
