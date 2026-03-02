@@ -213,7 +213,7 @@ class StreamingService:
 
     def __init__(self, config: Optional[Dict] = None):
         """
-        Initialise streaming service.
+        Initialize streaming service.
 
         Args:
             config: Configuration options:
@@ -249,7 +249,7 @@ class StreamingService:
         # Thread safety
         self._lock = threading.RLock()
 
-        logger.info("Streaming Service initialised, timeframes=%s", self._timeframes)
+        logger.info("Streaming Service initialized, timeframes=%s", self._timeframes)
 
     # ================================================================
     # SUBSCRIPTION MANAGEMENT

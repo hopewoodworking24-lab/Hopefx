@@ -53,7 +53,7 @@ class OrderFlowDashboard:
         dom_service: Optional[DepthOfMarketService] = None,
     ):
         """
-        Initialise dashboard with optional pre-built service instances.
+        Initialize dashboard with optional pre-built service instances.
 
         If not provided, global singleton instances are used.
         """
@@ -63,7 +63,7 @@ class OrderFlowDashboard:
         self._ts = time_and_sales or get_time_and_sales_service()
         self._dom = dom_service or get_dom_service()
 
-        logger.info("Order Flow Dashboard initialised")
+        logger.info("Order Flow Dashboard initialized")
 
     # ================================================================
     # MAIN ANALYSIS

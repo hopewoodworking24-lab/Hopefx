@@ -164,7 +164,7 @@ class AdvancedOrderFlowAnalyzer:
 
     def __init__(self, config: Optional[Dict] = None):
         """
-        Initialise advanced analyzer.
+        Initialize advanced analyzer.
 
         Args:
             config: Configuration options:
@@ -187,7 +187,7 @@ class AdvancedOrderFlowAnalyzer:
         self._trades: Dict[str, List] = defaultdict(list)
         self._cumulative_delta: Dict[str, float] = defaultdict(float)
 
-        logger.info("Advanced Order Flow Analyzer initialised")
+        logger.info("Advanced Order Flow Analyzer initialized")
 
     # ================================================================
     # TRADE MANAGEMENT

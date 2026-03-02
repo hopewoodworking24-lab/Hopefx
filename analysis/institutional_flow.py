@@ -119,7 +119,7 @@ class InstitutionalFlowDetector:
 
     def __init__(self, config: Optional[Dict] = None):
         """
-        Initialise detector.
+        Initialize detector.
 
         Args:
             config: Configuration options:
@@ -141,7 +141,7 @@ class InstitutionalFlowDetector:
         # Trade storage: symbol -> list of (timestamp, price, size, side)
         self._trades: Dict[str, List] = defaultdict(list)
 
-        logger.info("Institutional Flow Detector initialised")
+        logger.info("Institutional Flow Detector initialized")
 
     # ================================================================
     # TRADE INGESTION
