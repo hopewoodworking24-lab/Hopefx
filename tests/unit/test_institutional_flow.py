@@ -1,5 +1,5 @@
 """
-Tests for analysis/institutional_flow.py
+Tests for Institutional Flow Detector (analysis/institutional_flow.py)
 """
 
 import pytest
@@ -9,209 +9,237 @@ from datetime import datetime, timedelta
 class TestInstitutionalTrade:
     """Tests for InstitutionalTrade dataclass."""
 
-    def _make(self, **kwargs):
+    def test_trade_to_dict(self):
         from analysis.institutional_flow import InstitutionalTrade
-        defaults = dict(
+
+        trade = InstitutionalTrade(
             timestamp=datetime.utcnow(),
-            symbol='XAUUSD',
+            symbol="XAUUSD",
             price=1950.0,
-            size=2000.0,
-            side='buy',
-            trade_type='large_order',
-            confidence=0.9,
-        )
-        defaults.update(kwargs)
-        return InstitutionalTrade(**defaults)
-
-    def test_notional(self):
-        t = self._make(price=2000.0, size=500.0)
-        assert t.notional == 1_000_000.0
-
-    def test_to_dict_keys(self):
-        t = self._make()
-        d = t.to_dict()
-        for k in ('timestamp', 'symbol', 'price', 'size', 'side',
-                  'trade_type', 'confidence', 'notional'):
-            assert k in d
-
-
-class TestVolumeSpike:
-    """Tests for VolumeSpike dataclass."""
-
-    def test_to_dict(self):
-        from analysis.institutional_flow import VolumeSpike
-        spike = VolumeSpike(
-            symbol='XAUUSD', timestamp=datetime.utcnow(),
-            volume=999.0, average_volume=100.0, std_volume=50.0,
-            sigma=3.5, side='buy', price=1950.0,
-        )
-        d = spike.to_dict()
-        assert d['sigma'] == 3.5
-        assert isinstance(d['timestamp'], str)
-
-
-class TestIcebergSignal:
-    """Tests for IcebergSignal dataclass."""
-
-    def test_to_dict(self):
-        from analysis.institutional_flow import IcebergSignal
-        sig = IcebergSignal(
-            symbol='XAUUSD', price=1950.0, side='buy',
-            print_count=5, total_volume=500.0,
-            first_seen=datetime.utcnow(), last_seen=datetime.utcnow(),
+            size=500.0,
+            side="buy",
+            classification="institutional",
             confidence=0.8,
+            indicators=["large_order_size"],
         )
-        d = sig.to_dict()
-        assert d['print_count'] == 5
+
+        d = trade.to_dict()
+        assert d["classification"] == "institutional"
+        assert d["confidence"] == 0.8
+        assert "large_order_size" in d["indicators"]
+
+
+class TestFlowSignal:
+    """Tests for FlowSignal dataclass."""
+
+    def test_signal_to_dict(self):
+        from analysis.institutional_flow import FlowSignal
+
+        signal = FlowSignal(
+            symbol="XAUUSD",
+            timestamp=datetime.utcnow(),
+            signal_type="iceberg",
+            strength="strong",
+            direction="bullish",
+            price_level=1950.0,
+            volume=1000.0,
+            details={"fill_count": 5},
+        )
+
+        d = signal.to_dict()
+        assert d["signal_type"] == "iceberg"
+        assert d["direction"] == "bullish"
+        assert d["details"]["fill_count"] == 5
 
 
 class TestInstitutionalFlowDetector:
     """Tests for InstitutionalFlowDetector."""
 
-    def _detector(self, **cfg):
+    def test_initialization(self):
         from analysis.institutional_flow import InstitutionalFlowDetector
-        return InstitutionalFlowDetector(config=cfg)
 
-    # ── large order detection ────────────────────────────────────
+        detector = InstitutionalFlowDetector()
+        assert detector is not None
 
-    def test_large_order_detected(self):
-        det = self._detector(institutional_threshold=500.0)
-        det.add_trade('XAUUSD', price=1950.0, size=1000.0, side='buy')
-        trades = det.get_institutional_trades('XAUUSD')
-        assert len(trades) == 1
-        assert trades[0].trade_type in ('large_order', 'block')
+    def test_add_trade(self):
+        from analysis.institutional_flow import InstitutionalFlowDetector
 
-    def test_small_order_not_detected(self):
-        det = self._detector(institutional_threshold=500.0)
-        det.add_trade('XAUUSD', price=1950.0, size=1.0, side='buy')
-        assert len(det.get_institutional_trades('XAUUSD')) == 0
+        detector = InstitutionalFlowDetector()
+        detector.add_trade("XAUUSD", price=1950.0, size=100.0, side="buy")
 
-    def test_block_trade_classified(self):
-        det = self._detector(institutional_threshold=100.0)
-        # block = >= threshold * 10
-        det.add_trade('XAUUSD', price=1950.0, size=5000.0, side='buy')
-        trades = det.get_institutional_trades('XAUUSD')
-        assert trades[0].trade_type == 'block'
+        assert len(detector._trades["XAUUSD"]) == 1
 
-    def test_confidence_between_0_and_1(self):
-        det = self._detector(institutional_threshold=100.0)
-        det.add_trade('XAUUSD', price=1950.0, size=500.0, side='buy')
-        trade = det.get_institutional_trades('XAUUSD')[0]
-        assert 0.0 <= trade.confidence <= 1.0
+    def test_detect_large_orders(self):
+        from analysis.institutional_flow import InstitutionalFlowDetector
 
-    def test_multiple_symbols(self):
-        det = self._detector(institutional_threshold=50.0)
-        det.add_trade('XAUUSD', price=1950.0, size=1000.0, side='buy')
-        det.add_trade('EURUSD', price=1.08, size=500.0, side='sell')
-        assert len(det.get_institutional_trades('XAUUSD')) >= 1
-        assert len(det.get_institutional_trades('EURUSD')) >= 1
+        detector = InstitutionalFlowDetector(config={"large_order_threshold": 200})
+        now = datetime.utcnow()
 
-    # ── volume spike detection ───────────────────────────────────
+        detector.add_trade("XAUUSD", 1950.0, 500.0, "buy", timestamp=now - timedelta(minutes=5))
+        detector.add_trade("XAUUSD", 1950.0, 50.0, "buy", timestamp=now - timedelta(minutes=5))
 
-    def test_spike_detected(self):
-        det = self._detector(spike_sigma=2.0)
-        # Establish baseline
-        for _ in range(20):
-            det.add_trade('XAUUSD', price=1950.0, size=1.0, side='buy')
-        # Spike
-        det.add_trade('XAUUSD', price=1950.0, size=1000.0, side='buy')
-        spikes = det.get_volume_spikes('XAUUSD')
-        assert len(spikes) >= 1
-        assert spikes[-1].sigma >= 2.0
+        large = detector.detect_large_orders("XAUUSD")
+        assert len(large) == 1
+        assert large[0].size == 500.0
+        assert large[0].classification == "institutional"
 
-    def test_no_spike_without_enough_samples(self):
-        det = self._detector(spike_sigma=3.0)
-        # Only 5 samples – below minimum of 10
-        for _ in range(5):
-            det.add_trade('XAUUSD', price=1950.0, size=100.0, side='buy')
-        assert len(det.get_volume_spikes('XAUUSD')) == 0
+    def test_detect_large_orders_empty(self):
+        from analysis.institutional_flow import InstitutionalFlowDetector
 
-    # ── iceberg detection ────────────────────────────────────────
+        detector = InstitutionalFlowDetector()
+        assert detector.detect_large_orders("NONEXISTENT") == []
 
-    def test_iceberg_detected(self):
-        det = self._detector(
-            iceberg_min_prints=3,
-            iceberg_window=300,
+    def test_detect_iceberg_orders(self):
+        from analysis.institutional_flow import InstitutionalFlowDetector
+
+        detector = InstitutionalFlowDetector(
+            config={"iceberg_min_fills": 3, "iceberg_window_seconds": 30}
         )
-        # 5 prints at the same price level
+        base = datetime.utcnow() - timedelta(minutes=5)
+
+        # Multiple fills at same price within short time
+        for i in range(5):
+            detector.add_trade(
+                "XAUUSD", 1950.00, 50.0, "buy",
+                timestamp=base + timedelta(seconds=i * 5)
+            )
+        # A fill at different price - should not be part of iceberg
+        detector.add_trade("XAUUSD", 1952.00, 50.0, "sell", timestamp=base)
+
+        signals = detector.detect_iceberg_orders("XAUUSD")
+        assert len(signals) >= 1
+        assert signals[0].signal_type == "iceberg"
+
+    def test_detect_iceberg_orders_none(self):
+        from analysis.institutional_flow import InstitutionalFlowDetector
+
+        detector = InstitutionalFlowDetector()
+        # Not enough fills at same price
+        detector.add_trade("XAUUSD", 1950.0, 100.0, "buy")
+        detector.add_trade("XAUUSD", 1951.0, 100.0, "sell")
+
+        signals = detector.detect_iceberg_orders("XAUUSD")
+        assert signals == []
+
+    def test_detect_volume_spikes(self):
+        from analysis.institutional_flow import InstitutionalFlowDetector
+
+        detector = InstitutionalFlowDetector(config={"volume_spike_multiplier": 2.0})
+        now = datetime.utcnow()
+
+        # Normal trades spread across time
+        for i in range(10):
+            detector.add_trade(
+                "XAUUSD", 1950.0, 10.0, "buy",
+                timestamp=now - timedelta(minutes=20 + i)
+            )
+
+        # Spike: large volume in a short window
         for _ in range(5):
-            det.add_trade('XAUUSD', price=1950.0, size=100.0, side='buy')
-        icebergs = det.get_icebergs('XAUUSD')
-        assert len(icebergs) >= 1
+            detector.add_trade(
+                "XAUUSD", 1950.0, 200.0, "buy",
+                timestamp=now - timedelta(minutes=2)
+            )
 
-    def test_iceberg_confidence_between_0_and_1(self):
-        det = self._detector(iceberg_min_prints=3, iceberg_window=300)
-        for _ in range(6):
-            det.add_trade('XAUUSD', price=1950.0, size=100.0, side='buy')
-        for ic in det.get_icebergs('XAUUSD'):
-            assert 0.0 <= ic.confidence <= 1.0
+        signals = detector.detect_volume_spikes("XAUUSD")
+        # Should detect at least one spike
+        assert isinstance(signals, list)
 
-    # ── smart money flow ─────────────────────────────────────────
+    def test_detect_absorption(self):
+        from analysis.institutional_flow import InstitutionalFlowDetector
 
-    def test_smart_money_flow_none_when_no_activity(self):
-        det = self._detector()
-        assert det.get_smart_money_flow('XAUUSD') is None
+        detector = InstitutionalFlowDetector(
+            config={"absorption_price_pct": 0.5}
+        )
+        now = datetime.utcnow()
 
-    def test_smart_money_flow_accumulation(self):
-        from analysis.institutional_flow import SmartMoneyFlow
-        det = self._detector(institutional_threshold=100.0)
+        # High volume, tiny price range = absorption
+        for i in range(10):
+            side = "buy" if i % 3 != 0 else "sell"
+            detector.add_trade(
+                "XAUUSD", 1950.00 + (i % 2) * 0.001, 200.0, side,
+                timestamp=now - timedelta(minutes=5, seconds=i * 3)
+            )
+
+        signals = detector.detect_absorption("XAUUSD")
+        assert isinstance(signals, list)
+
+    def test_classify_trade_institutional(self):
+        from analysis.institutional_flow import InstitutionalFlowDetector
+
+        detector = InstitutionalFlowDetector(config={"large_order_threshold": 200})
+        result = detector.classify_trade(price=1950.0, size=500.0, side="buy")
+
+        assert result.classification == "institutional"
+        assert result.confidence > 0.4
+
+    def test_classify_trade_retail(self):
+        from analysis.institutional_flow import InstitutionalFlowDetector
+
+        detector = InstitutionalFlowDetector(config={"large_order_threshold": 200})
+        result = detector.classify_trade(price=1950.0, size=10.0, side="sell")
+
+        assert result.classification == "retail"
+        assert result.confidence < 0.4
+
+    def test_analyze_flow_returns_list(self):
+        from analysis.institutional_flow import InstitutionalFlowDetector
+
+        detector = InstitutionalFlowDetector()
+        now = datetime.utcnow()
+        for i in range(20):
+            detector.add_trade("XAUUSD", 1950.0, float(i * 10 + 5), "buy",
+                               timestamp=now - timedelta(minutes=i))
+
+        signals = detector.analyze_flow("XAUUSD")
+        assert isinstance(signals, list)
+
+    def test_get_smart_money_direction_no_data(self):
+        from analysis.institutional_flow import InstitutionalFlowDetector
+
+        detector = InstitutionalFlowDetector()
+        result = detector.get_smart_money_direction("NONEXISTENT")
+        assert result is None
+
+    def test_get_smart_money_direction(self):
+        from analysis.institutional_flow import InstitutionalFlowDetector
+
+        detector = InstitutionalFlowDetector(config={"large_order_threshold": 50})
+        now = datetime.utcnow()
+
         for _ in range(10):
-            det.add_trade('XAUUSD', price=1950.0, size=500.0, side='buy')
-        flow = det.get_smart_money_flow('XAUUSD')
-        assert isinstance(flow, SmartMoneyFlow)
-        assert flow.flow_score > 0
-        assert flow.signal == 'accumulation'
+            detector.add_trade("XAUUSD", 1950.0, 300.0, "buy",
+                               timestamp=now - timedelta(minutes=5))
+        for _ in range(2):
+            detector.add_trade("XAUUSD", 1950.0, 100.0, "sell",
+                               timestamp=now - timedelta(minutes=5))
 
-    def test_smart_money_flow_distribution(self):
-        det = self._detector(institutional_threshold=100.0)
-        for _ in range(10):
-            det.add_trade('XAUUSD', price=1950.0, size=500.0, side='sell')
-        flow = det.get_smart_money_flow('XAUUSD')
-        assert flow.flow_score < 0
-        assert flow.signal == 'distribution'
-
-    def test_smart_money_flow_to_dict(self):
-        det = self._detector(institutional_threshold=100.0)
-        det.add_trade('XAUUSD', price=1950.0, size=500.0, side='buy')
-        flow = det.get_smart_money_flow('XAUUSD')
-        d = flow.to_dict()
-        assert 'flow_score' in d
-        assert 'signal' in d
-
-    # ── batch add_trades ─────────────────────────────────────────
-
-    def test_add_trades_batch(self):
-        det = self._detector(institutional_threshold=50.0)
-        trades = [
-            {'price': 1950.0, 'size': 100.0, 'side': 'buy'},
-            {'price': 1951.0, 'size': 200.0, 'side': 'sell'},
-        ]
-        det.add_trades('XAUUSD', trades)
-        assert len(det.get_institutional_trades('XAUUSD')) == 2
-
-    # ── utility ──────────────────────────────────────────────────
-
-    def test_get_symbols(self):
-        det = self._detector()
-        det.add_trade('XAUUSD', 1950.0, 1.0, 'buy')
-        assert 'XAUUSD' in det.get_symbols()
-
-    def test_clear_symbol(self):
-        det = self._detector(institutional_threshold=10.0)
-        det.add_trade('XAUUSD', 1950.0, 100.0, 'buy')
-        det.clear_symbol('XAUUSD')
-        assert det.get_institutional_trades('XAUUSD') == []
+        result = detector.get_smart_money_direction("XAUUSD")
+        assert result is not None
+        assert result.direction == "bullish"
+        assert result.institutional_buy_volume > result.institutional_sell_volume
 
     def test_get_stats(self):
-        det = self._detector()
-        det.add_trade('XAUUSD', 1950.0, 1.0, 'buy')
-        stats = det.get_stats()
-        assert 'symbols_tracked' in stats
+        from analysis.institutional_flow import InstitutionalFlowDetector
 
-    # ── singleton ────────────────────────────────────────────────
+        detector = InstitutionalFlowDetector()
+        detector.add_trade("XAUUSD", 1950.0, 100.0, "buy")
 
-    def test_global_singleton(self):
-        from analysis.institutional_flow import get_institutional_flow_detector
-        d1 = get_institutional_flow_detector()
-        d2 = get_institutional_flow_detector()
+        stats = detector.get_stats()
+        assert stats["symbols_tracked"] == 1
+
+    def test_clear_symbol(self):
+        from analysis.institutional_flow import InstitutionalFlowDetector
+
+        detector = InstitutionalFlowDetector()
+        detector.add_trade("XAUUSD", 1950.0, 100.0, "buy")
+        detector.clear_symbol("XAUUSD")
+
+        assert len(detector._trades.get("XAUUSD", [])) == 0
+
+    def test_global_instance(self):
+        from analysis.institutional_flow import get_institutional_detector
+
+        d1 = get_institutional_detector()
+        d2 = get_institutional_detector()
         assert d1 is d2

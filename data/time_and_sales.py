@@ -1,578 +1,615 @@
 """
 Time & Sales Service
 
-Real-time trade tape with professional-grade features:
-- 10,000-trade circular buffer
-- Bid/Ask aggressor identification
-- Trade velocity tracking
-- Large trade detection and alerting
+Real-time trade tape (time & sales) with:
+- Circular buffer storage (configurable max trades, default 10,000)
+- Aggressor side identification (BID/ASK)
+- Historical trade queries with filtering
+- Trade velocity calculation (trades per minute)
+- Large trade alerts
 - Trade statistics and analytics
-- FastAPI endpoints
-
-Compatible with all brokers and the existing DOM/order-flow modules.
+- Thread-safe implementation
 """
 
 import logging
 import threading
 from collections import deque
 from datetime import datetime, timedelta
-from dataclasses import dataclass, field, asdict
-from enum import Enum
-from typing import Callable, Dict, List, Optional, Tuple
+lfrom typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
-# ────────────────────────────────────────────────────────────────────
-# Constants / defaults
-# ────────────────────────────────────────────────────────────────────
-DEFAULT_BUFFER_SIZE = 10_000
-DEFAULT_LARGE_TRADE_MULTIPLIER = 5.0   # x average size
-DEFAULT_VELOCITY_WINDOW = 60           # seconds
 
-
-# ────────────────────────────────────────────────────────────────────
-# Enums
-# ────────────────────────────────────────────────────────────────────
-class Aggressor(str, Enum):
-    """Who hit the book."""
-    BUY = "buy"
-    SELL = "sell"
-    UNKNOWN = "unknown"
-
-
-# ────────────────────────────────────────────────────────────────────
-# Data-classes
-# ────────────────────────────────────────────────────────────────────
 @dataclass
-class TimeAndSalesRecord:
-    """Single entry in the time-and-sales tape."""
+class ExecutedTrade:
+    """Individual executed trade record from the tape."""
+
     timestamp: datetime
     symbol: str
     price: float
     size: float
-    aggressor: Aggressor
+    side: str  # 'buy' or 'sell' (aggressor side)
     trade_id: Optional[str] = None
-    is_large: bool = False
-    bid_price: Optional[float] = None
-    ask_price: Optional[float] = None
-
-    @property
-    def is_buy(self) -> bool:
-        return self.aggressor == Aggressor.BUY
-
-    @property
-    def is_sell(self) -> bool:
-        return self.aggressor == Aggressor.SELL
-
-    @property
-    def notional(self) -> float:
-        return self.price * self.size
+    is_aggressive_buy: bool = False
+    is_aggressive_sell: bool = False
+    is_large_trade: bool = False
 
     def to_dict(self) -> Dict:
-        d = asdict(self)
-        d['timestamp'] = self.timestamp.isoformat()
-        d['aggressor'] = self.aggressor.value
-        d['is_buy'] = self.is_buy
-        d['is_sell'] = self.is_sell
-        d['notional'] = self.notional
-        return d
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "symbol": self.symbol,
+            "price": self.price,
+            "size": self.size,
+            "side": self.side,
+            "trade_id": self.trade_id,
+            "is_aggressive_buy": self.is_aggressive_buy,
+            "is_aggressive_sell": self.is_aggressive_sell,
+            "is_large_trade": self.is_large_trade,
+        }
 
 
 @dataclass
 class TradeVelocity:
-    """Trade velocity metrics for a symbol."""
+    """Trade velocity metrics over a rolling window."""
+
     symbol: str
-    window_seconds: int
-    trade_count: int
-    total_volume: float
-    buy_volume: float
-    sell_volume: float
-    trades_per_second: float
-    volume_per_second: float
-    delta_per_second: float
-    dominant_side: str        # 'buy', 'sell', 'neutral'
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    trades_per_minute: float
+    volume_per_minute: float
+    avg_trade_size: float
+    buy_trades_pct: float
+    sell_trades_pct: float
 
     def to_dict(self) -> Dict:
-        d = asdict(self)
-        d['timestamp'] = self.timestamp.isoformat()
-        return d
+        return {
+            "symbol": self.symbol,
+            "trades_per_minute": self.trades_per_minute,
+            "volume_per_minute": self.volume_per_minute,
+            "avg_trade_size": self.avg_trade_size,
+            "buy_trades_pct": self.buy_trades_pct,
+            "sell_trades_pct": self.sell_trades_pct,
+        }
 
 
 @dataclass
-class TapeStatistics:
-    """Aggregated time-and-sales statistics for a symbol."""
+class AggressorStats:
+    """Buy vs sell aggressor statistics."""
+
     symbol: str
-    period_start: datetime
-    period_end: datetime
     total_trades: int
-    total_volume: float
+    buy_trades: int
+    sell_trades: int
     buy_volume: float
     sell_volume: float
-    delta: float
-    vwap: float
-    large_trade_count: int
-    large_trade_volume: float
-    avg_trade_size: float
-    max_trade_size: float
-    min_price: float
-    max_price: float
-    price_range: float
+    buy_pct: float
+    sell_pct: float
+    net_aggression: float  # positive = buy-side dominant
 
     def to_dict(self) -> Dict:
-        d = asdict(self)
-        d['period_start'] = self.period_start.isoformat()
-        d['period_end'] = self.period_end.isoformat()
-        return d
+        return {
+            "symbol": self.symbol,
+            "total_trades": self.total_trades,
+            "buy_trades": self.buy_trades,
+            "sell_trades": self.sell_trades,
+            "buy_volume": self.buy_volume,
+            "sell_volume": self.sell_volume,
+            "buy_pct": self.buy_pct,
+            "sell_pct": self.sell_pct,
+            "net_aggression": self.net_aggression,
+        }
 
 
-# ────────────────────────────────────────────────────────────────────
-# Core service
-# ────────────────────────────────────────────────────────────────────
 class TimeAndSalesService:
     """
-    Professional time-and-sales (trade tape) service.
+    Time & Sales (trade tape) service.
 
-    Features:
-    - Thread-safe 10,000-trade circular buffer per symbol
-    - Automatic aggressor classification from bid/ask context
-    - Trade velocity calculation (trades/s, volume/s, delta/s)
-    - Large-trade detection with configurable multiplier
-    - Event callbacks for real-time processing
-    - Handles 1,000+ trades per second
+    Captures and analyzes real-time trade flow including aggressor side
+    identification, velocity metrics, and large trade detection.
 
-    Usage::
+    Usage:
+        service = TimeAndSalesService(config={'large_trade_threshold': 500})
 
-        service = TimeAndSalesService()
+        # Add a trade
+        service.add_trade('XAUUSD', price=1950.0, size=100.0, side='buy')
 
-        # Feed trades (with optional bid/ask for aggressor inference)
-        service.add_trade('XAUUSD', price=1950.0, size=10.0,
-                          aggressor='buy', bid=1949.95, ask=1950.05)
+        # Get recent trades
+        trades = service.get_recent_trades('XAUUSD', n=50)
 
-        # Latest records
-        records = service.get_tape('XAUUSD', limit=50)
-
-        # Velocity
-        vel = service.get_velocity('XAUUSD')
+        # Get velocity
+        velocity = service.get_trade_velocity('XAUUSD')
     """
 
     def __init__(self, config: Optional[Dict] = None):
         """
-        Initialize the service.
+        Initialize Time & Sales service.
 
         Args:
-            config: Optional overrides:
-                - buffer_size (int): circular buffer depth per symbol
-                - large_trade_multiplier (float): × avg size to flag large
-                - velocity_window (int): seconds for velocity window
+            config: Configuration options:
+                - max_trades: Maximum trades per symbol (default 10000)
+                - large_trade_threshold: Size threshold for large trades (default 100)
+                - velocity_window_minutes: Window for velocity calculation (default 5)
         """
-        cfg = config or {}
-        self._buffer_size: int = cfg.get('buffer_size', DEFAULT_BUFFER_SIZE)
-        self._large_multiplier: float = cfg.get('large_trade_multiplier',
-                                                 DEFAULT_LARGE_TRADE_MULTIPLIER)
-        self._velocity_window: int = cfg.get('velocity_window',
-                                             DEFAULT_VELOCITY_WINDOW)
+        self.config = config or {}
+        self._max_trades = self.config.get("max_trades", 10000)
+        self._large_trade_threshold = self.config.get("large_trade_threshold", 100)
+        self._velocity_window_minutes = self.config.get("velocity_window_minutes", 5)
 
-        # Per-symbol circular buffers
-        self._tapes: Dict[str, deque] = {}
+        # Circular buffers per symbol
+        self._trades: Dict[str, deque] = {}
 
-        # Running size sums for large-trade detection (simple rolling avg)
-        self._size_sums: Dict[str, float] = {}
-        self._size_counts: Dict[str, int] = {}
+        # Large trade alert callbacks
+        self._large_trade_callbacks: List = []
 
-        # Registered callbacks  (symbol -> list[callable])
-        self._callbacks: Dict[str, List[Callable]] = {}
-        self._global_callbacks: List[Callable] = []
-
+        # Thread safety
         self._lock = threading.RLock()
-        logger.info("TimeAndSalesService initialized (buffer=%d)", self._buffer_size)
 
-    # ────────────────────────────────────────────────────────────────
-    # Public write API
-    # ────────────────────────────────────────────────────────────────
+        logger.info("Time & Sales Service initialized")
+
+    # ================================================================
+    # TRADE INGESTION
+    # ================================================================
 
     def add_trade(
         self,
         symbol: str,
         price: float,
         size: float,
-        aggressor: str = 'unknown',
+        side: str,
         timestamp: Optional[datetime] = None,
         trade_id: Optional[str] = None,
-        bid: Optional[float] = None,
-        ask: Optional[float] = None,
-    ) -> TimeAndSalesRecord:
+        ask_price: Optional[float] = None,
+        bid_price: Optional[float] = None,
+    ) -> ExecutedTrade:
         """
-        Add a single trade to the tape.
+        Add a trade to the tape.
 
         Args:
-            symbol:    Instrument ticker
-            price:     Execution price
-            size:      Trade size / volume
-            aggressor: 'buy', 'sell', or 'unknown'. If 'unknown' is
-                       supplied but bid/ask are known the aggressor is
-                       inferred automatically.
-            timestamp: Trade time (UTC). Defaults to *now*.
-            trade_id:  Optional unique identifier.
-            bid:       Best bid at time of trade (for aggressor inference).
-            ask:       Best ask at time of trade (for aggressor inference).
+            symbol: Trading symbol
+            price: Execution price
+            size: Trade size
+            side: Aggressor side ('buy' or 'sell')
+            timestamp: Trade timestamp (defaults to now)
+            trade_id: Optional unique trade identifier
+            ask_price: Current ask for aggressor determination
+            bid_price: Current bid for aggressor determination
 
         Returns:
-            The created :class:`TimeAndSalesRecord`.
+            ExecutedTrade object
         """
-        agg = self._classify_aggressor(price, aggressor, bid, ask)
+        side = side.lower()
         ts = timestamp or datetime.utcnow()
 
+        # Determine aggressor flags
+        is_aggressive_buy = False
+        is_aggressive_sell = False
+        if side == "buy":
+            is_aggressive_buy = True
+            # Confirm via ask price if provided
+            if ask_price is not None:
+                is_aggressive_buy = price >= ask_price
+        elif side == "sell":
+            is_aggressive_sell = True
+            # Confirm via bid price if provided
+            if bid_price is not None:
+                is_aggressive_sell = price <= bid_price
+
+        is_large = size >= self._large_trade_threshold
+
+        trade = ExecutedTrade(
+            timestamp=ts,
+            symbol=symbol,
+            price=price,
+            size=size,
+            side=side,
+            trade_id=trade_id,
+            is_aggressive_buy=is_aggressive_buy,
+            is_aggressive_sell=is_aggressive_sell,
+            is_large_trade=is_large,
+        )
+
         with self._lock:
-            if symbol not in self._tapes:
-                self._tapes[symbol] = deque(maxlen=self._buffer_size)
-                self._size_sums[symbol] = 0.0
-                self._size_counts[symbol] = 0
+            if symbol not in self._trades:
+                self._trades[symbol] = deque(maxlen=self._max_trades)
+            self._trades[symbol].append(trade)
 
-            # Rolling average for large-trade detection
-            self._size_sums[symbol] += size
-            self._size_counts[symbol] += 1
-            avg_size = self._size_sums[symbol] / self._size_counts[symbol]
-            is_large = size >= avg_size * self._large_multiplier
-
-            record = TimeAndSalesRecord(
-                timestamp=ts,
-                symbol=symbol,
-                price=price,
-                size=size,
-                aggressor=agg,
-                trade_id=trade_id,
-                is_large=is_large,
-                bid_price=bid,
-                ask_price=ask,
-            )
-            self._tapes[symbol].append(record)
-
-        # Fire callbacks outside the lock
-        self._dispatch(symbol, record)
-
+        # Fire large trade callbacks outside lock
         if is_large:
-            logger.debug(
-                "Large trade detected: %s @ %.5f x %.2f (avg=%.2f)",
-                symbol, price, size, avg_size,
-            )
+            for cb in self._large_trade_callbacks:
+                try:
+                    cb(trade)
+                except Exception as exc:  # pragma: no cover
+                    logger.error("Large trade callback error: %s", exc)
 
-        return record
+        logger.debug("Trade added: %s %s@%s x%s", symbol, side, price, size)
+        return trade
 
-    def add_trades(self, symbol: str, trades: List[Dict]) -> List[TimeAndSalesRecord]:
-        """Batch-insert trades. Each dict must contain 'price' and 'size'."""
-        return [self.add_trade(symbol, **t) for t in trades]
+    def register_large_trade_callback(self, callback) -> None:
+        """Register a callback for large trade alerts."""
+        self._large_trade_callbacks.append(callback)
 
-    # ────────────────────────────────────────────────────────────────
-    # Public read API
-    # ────────────────────────────────────────────────────────────────
+    # ================================================================
+    # TRADE RETRIEVAL
+    # ================================================================
 
-    def get_tape(
+    def get_recent_trades(self, symbol: str, n: int = 100) -> List[ExecutedTrade]:
+        """
+        Get the most recent N trades for a symbol.
+
+        Args:
+            symbol: Trading symbol
+            n: Number of trades to return
+
+        Returns:
+            List of ExecutedTrade objects (newest last)
+        """
+        with self._lock:
+            buffer = self._trades.get(symbol)
+            if buffer is None:
+                return []
+            trades = list(buffer)
+        return trades[-n:]
+
+    def get_trades_by_time(
         self,
         symbol: str,
-        limit: int = 100,
-        start_time: Optional[datetime] = None,
+        start_time: datetime,
         end_time: Optional[datetime] = None,
-    ) -> List[TimeAndSalesRecord]:
-        """Return the most recent *limit* records, with optional time slice."""
+    ) -> List[ExecutedTrade]:
+        """
+        Filter trades by time range.
+
+        Args:
+            symbol: Trading symbol
+            start_time: Start of time range (inclusive)
+            end_time: End of time range (inclusive, defaults to now)
+
+        Returns:
+            List of matching ExecutedTrade objects
+        """
+        end = end_time or datetime.utcnow()
         with self._lock:
-            records = list(self._tapes.get(symbol, []))
+            buffer = self._trades.get(symbol)
+            if buffer is None:
+                return []
+            trades = list(buffer)
 
-        if start_time:
-            records = [r for r in records if r.timestamp >= start_time]
-        if end_time:
-            records = [r for r in records if r.timestamp <= end_time]
-
-        return records[-limit:]
+        return [t for t in trades if start_time <= t.timestamp <= end]
 
     def get_large_trades(
         self,
         symbol: str,
-        limit: int = 50,
-    ) -> List[TimeAndSalesRecord]:
-        """Return the most recent large trades."""
-        with self._lock:
-            all_records = list(self._tapes.get(symbol, []))
-        large = [r for r in all_records if r.is_large]
-        return large[-limit:]
+        min_size: Optional[float] = None,
+        lookback_minutes: int = 60,
+    ) -> List[ExecutedTrade]:
+        """
+        Get large trades above a size threshold.
 
-    def get_velocity(
+        Args:
+            symbol: Trading symbol
+            min_size: Minimum size threshold (defaults to configured threshold)
+            lookback_minutes: How far back to look
+
+        Returns:
+            List of large ExecutedTrade objects
+        """
+        threshold = min_size if min_size is not None else self._large_trade_threshold
+        start = datetime.utcnow() - timedelta(minutes=lookback_minutes)
+        trades = self.get_trades_by_time(symbol, start_time=start)
+        return [t for t in trades if t.size >= threshold]
+
+    # ================================================================
+    # ANALYTICS
+    # ================================================================
+
+    def get_trade_velocity(
         self,
         symbol: str,
-        window_seconds: Optional[int] = None,
+        window_minutes: Optional[int] = None,
     ) -> Optional[TradeVelocity]:
         """
-        Compute trade velocity metrics over the last *window_seconds*.
+        Calculate trade velocity metrics over a rolling window.
 
-        Returns *None* if there are no trades for the symbol.
+        Args:
+            symbol: Trading symbol
+            window_minutes: Rolling window in minutes (defaults to configured value)
+
+        Returns:
+            TradeVelocity or None if insufficient data
         """
-        window = window_seconds or self._velocity_window
-        cutoff = datetime.utcnow() - timedelta(seconds=window)
+        window = window_minutes or self._velocity_window_minutes
+        start = datetime.utcnow() - timedelta(minutes=window)
+        trades = self.get_trades_by_time(symbol, start_time=start)
 
-        with self._lock:
-            records = [
-                r for r in self._tapes.get(symbol, [])
-                if r.timestamp >= cutoff
-            ]
-
-        if not records:
+        if not trades:
             return None
 
-        buy_vol = sum(r.size for r in records if r.is_buy)
-        sell_vol = sum(r.size for r in records if r.is_sell)
-        total_vol = buy_vol + sell_vol
-        delta = buy_vol - sell_vol
+        total = len(trades)
+        total_volume = sum(t.size for t in trades)
+        buy_count = sum(1 for t in trades if t.side == "buy")
+        sell_count = total - buy_count
 
-        elapsed = max(
-            (records[-1].timestamp - records[0].timestamp).total_seconds(),
-            1.0,
-        )
-
-        if buy_vol > sell_vol * 1.2:
-            dominant = 'buy'
-        elif sell_vol > buy_vol * 1.2:
-            dominant = 'sell'
-        else:
-            dominant = 'neutral'
+        trades_per_min = total / window
+        volume_per_min = total_volume / window
+        avg_size = total_volume / total if total > 0 else 0.0
+        buy_pct = round(buy_count / total * 100, 2) if total > 0 else 0.0
+        sell_pct = round(sell_count / total * 100, 2) if total > 0 else 0.0
 
         return TradeVelocity(
             symbol=symbol,
-            window_seconds=window,
-            trade_count=len(records),
-            total_volume=total_vol,
-            buy_volume=buy_vol,
-            sell_volume=sell_vol,
-            trades_per_second=round(len(records) / elapsed, 4),
-            volume_per_second=round(total_vol / elapsed, 4),
-            delta_per_second=round(delta / elapsed, 4),
-            dominant_side=dominant,
+            trades_per_minute=round(trades_per_min, 4),
+            volume_per_minute=round(volume_per_min, 4),
+            avg_trade_size=round(avg_size, 4),
+            buy_trades_pct=buy_pct,
+            sell_trades_pct=sell_pct,
         )
 
-    def get_statistics(
+    def get_aggressor_stats(
         self,
         symbol: str,
-        lookback_seconds: int = 3600,
-    ) -> Optional[TapeStatistics]:
-        """Return aggregated statistics over the lookback window."""
-        cutoff = datetime.utcnow() - timedelta(seconds=lookback_seconds)
-        records = self.get_tape(symbol, limit=self._buffer_size,
-                                start_time=cutoff)
-
-        if not records:
-            return None
-
-        prices = [r.price for r in records]
-        sizes = [r.size for r in records]
-        buy_vol = sum(r.size for r in records if r.is_buy)
-        sell_vol = sum(r.size for r in records if r.is_sell)
-        total_vol = buy_vol + sell_vol
-
-        # VWAP
-        vwap = (
-            sum(r.price * r.size for r in records) / total_vol
-            if total_vol > 0 else 0.0
-        )
-
-        large = [r for r in records if r.is_large]
-
-        return TapeStatistics(
-            symbol=symbol,
-            period_start=records[0].timestamp,
-            period_end=records[-1].timestamp,
-            total_trades=len(records),
-            total_volume=total_vol,
-            buy_volume=buy_vol,
-            sell_volume=sell_vol,
-            delta=buy_vol - sell_vol,
-            vwap=round(vwap, 5),
-            large_trade_count=len(large),
-            large_trade_volume=sum(r.size for r in large),
-            avg_trade_size=round(sum(sizes) / len(sizes), 4),
-            max_trade_size=max(sizes),
-            min_price=min(prices),
-            max_price=max(prices),
-            price_range=round(max(prices) - min(prices), 5),
-        )
-
-    # ────────────────────────────────────────────────────────────────
-    # Callbacks / event system
-    # ────────────────────────────────────────────────────────────────
-
-    def register_callback(
-        self,
-        callback: Callable[[TimeAndSalesRecord], None],
-        symbol: Optional[str] = None,
-    ):
+        lookback_minutes: int = 60,
+    ) -> Optional[AggressorStats]:
         """
-        Register a callback invoked on every new trade.
+        Get buy vs sell aggressor statistics.
 
         Args:
-            callback: Callable receiving :class:`TimeAndSalesRecord`.
-            symbol:   If given, only fires for that symbol; else all symbols.
+            symbol: Trading symbol
+            lookback_minutes: Lookback window in minutes
+
+        Returns:
+            AggressorStats or None if no data
         """
-        with self._lock:
-            if symbol:
-                if symbol not in self._callbacks:
-                    self._callbacks[symbol] = []
-                self._callbacks[symbol].append(callback)
-            else:
-                self._global_callbacks.append(callback)
+        start = datetime.utcnow() - timedelta(minutes=lookback_minutes)
+        trades = self.get_trades_by_time(symbol, start_time=start)
 
-    def unregister_callback(
+        if not trades:
+            return None
+
+        total = len(trades)
+        buy_trades = [t for t in trades if t.side == "buy"]
+        sell_trades = [t for t in trades if t.side == "sell"]
+
+        buy_vol = sum(t.size for t in buy_trades)
+        sell_vol = sum(t.size for t in sell_trades)
+        total_vol = buy_vol + sell_vol
+
+        buy_pct = round(len(buy_trades) / total * 100, 2) if total > 0 else 0.0
+        sell_pct = round(len(sell_trades) / total * 100, 2) if total > 0 else 0.0
+        net = round((buy_vol - sell_vol) / total_vol, 4) if total_vol > 0 else 0.0
+
+        return AggressorStats(
+            symbol=symbol,
+            total_trades=total,
+            buy_trades=len(buy_trades),
+            sell_trades=len(sell_trades),
+            buy_volume=buy_vol,
+            sell_volume=sell_vol,
+            buy_pct=buy_pct,
+            sell_pct=sell_pct,
+            net_aggression=net,
+        )
+
+    def get_trade_histogram(
         self,
-        callback: Callable,
-        symbol: Optional[str] = None,
-    ):
-        """Unregister a previously registered callback."""
-        with self._lock:
-            if symbol and symbol in self._callbacks:
-                self._callbacks[symbol] = [
-                    c for c in self._callbacks[symbol] if c != callback
-                ]
-            else:
-                self._global_callbacks = [
-                    c for c in self._global_callbacks if c != callback
-                ]
+        symbol: str,
+        bins: int = 20,
+        lookback_minutes: int = 60,
+    ) -> List[Dict]:
+        """
+        Get trade distribution by price level (histogram).
 
-    # ────────────────────────────────────────────────────────────────
-    # Utility
-    # ────────────────────────────────────────────────────────────────
+        Args:
+            symbol: Trading symbol
+            bins: Number of price bins
+            lookback_minutes: Lookback window
+
+        Returns:
+            List of histogram buckets with price/volume info
+        """
+        start = datetime.utcnow() - timedelta(minutes=lookback_minutes)
+        trades = self.get_trades_by_time(symbol, start_time=start)
+
+        if not trades:
+            return []
+
+        prices = [t.price for t in trades]
+        min_p, max_p = min(prices), max(prices)
+        if min_p == max_p:
+            return [
+                {
+                    "price_low": min_p,
+                    "price_high": max_p,
+                    "trade_count": len(trades),
+                    "total_volume": sum(t.size for t in trades),
+                    "buy_volume": sum(t.size for t in trades if t.side == "buy"),
+                    "sell_volume": sum(t.size for t in trades if t.side == "sell"),
+                }
+            ]
+
+        bucket_size = (max_p - min_p) / bins
+        buckets: Dict[int, Dict] = {}
+
+        for trade in trades:
+            idx = min(int((trade.price - min_p) / bucket_size), bins - 1)
+            if idx not in buckets:
+                buckets[idx] = {
+                    "price_low": round(min_p + idx * bucket_size, 5),
+                    "price_high": round(min_p + (idx + 1) * bucket_size, 5),
+                    "trade_count": 0,
+                    "total_volume": 0.0,
+                    "buy_volume": 0.0,
+                    "sell_volume": 0.0,
+                }
+            b = buckets[idx]
+            b["trade_count"] += 1
+            b["total_volume"] += trade.size
+            if trade.side == "buy":
+                b["buy_volume"] += trade.size
+            else:
+                b["sell_volume"] += trade.size
+
+        return [buckets[k] for k in sorted(buckets)]
+
+    def get_trade_statistics(
+        self,
+        symbol: str,
+        lookback_minutes: int = 60,
+    ) -> Dict:
+        """
+        Get comprehensive trade statistics.
+
+        Args:
+            symbol: Trading symbol
+            lookback_minutes: Lookback window
+
+        Returns:
+            Dict with trade statistics
+        """
+        start = datetime.utcnow() - timedelta(minutes=lookback_minutes)
+        trades = self.get_trades_by_time(symbol, start_time=start)
+
+        if not trades:
+            return {"symbol": symbol, "trade_count": 0}
+
+        sizes = [t.size for t in trades]
+        prices = [t.price for t in trades]
+        buy_vol = sum(t.size for t in trades if t.side == "buy")
+        sell_vol = sum(t.size for t in trades if t.side == "sell")
+
+        return {
+            "symbol": symbol,
+            "lookback_minutes": lookback_minutes,
+            "trade_count": len(trades),
+            "total_volume": sum(sizes),
+            "buy_volume": buy_vol,
+            "sell_volume": sell_vol,
+            "avg_trade_size": round(sum(sizes) / len(sizes), 4),
+            "min_trade_size": min(sizes),
+            "max_trade_size": max(sizes),
+            "price_high": max(prices),
+            "price_low": min(prices),
+            "price_range": round(max(prices) - min(prices), 5),
+            "large_trade_count": sum(1 for t in trades if t.is_large_trade),
+        }
+
+    # ================================================================
+    # UTILITY
+    # ================================================================
 
     def get_symbols(self) -> List[str]:
-        """Return symbols that have tape data."""
+        """Get list of symbols with trade data."""
         with self._lock:
-            return list(self._tapes.keys())
+            return list(self._trades.keys())
 
-    def clear_symbol(self, symbol: str):
-        """Remove all tape data for *symbol*."""
+    def get_trade_count(self, symbol: str) -> int:
+        """Get number of stored trades for a symbol."""
         with self._lock:
-            self._tapes.pop(symbol, None)
-            self._size_sums.pop(symbol, None)
-            self._size_counts.pop(symbol, None)
+            buffer = self._trades.get(symbol)
+            return len(buffer) if buffer else 0
+
+    def clear_symbol(self, symbol: str) -> None:
+        """Clear trade data for a symbol."""
+        with self._lock:
+            self._trades.pop(symbol, None)
+
+    def clear_all(self) -> None:
+        """Clear all trade data."""
+        with self._lock:
+            self._trades.clear()
 
     def get_stats(self) -> Dict:
-        """Return service-level diagnostics."""
+        """Get service statistics."""
         with self._lock:
             return {
-                'symbols_tracked': len(self._tapes),
-                'symbols': list(self._tapes.keys()),
-                'buffer_size': self._buffer_size,
-                'trades_by_symbol': {
-                    s: len(buf) for s, buf in self._tapes.items()
-                },
+                "symbols_tracked": len(self._trades),
+                "symbols": list(self._trades.keys()),
+                "trade_counts": {s: len(b) for s, b in self._trades.items()},
+                "max_trades_per_symbol": self._max_trades,
+                "large_trade_threshold": self._large_trade_threshold,
             }
 
-    # ────────────────────────────────────────────────────────────────
-    # Private helpers
-    # ────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _classify_aggressor(
-        price: float,
-        aggressor: str,
-        bid: Optional[float],
-        ask: Optional[float],
-    ) -> Aggressor:
-        """Return confirmed/inferred aggressor enum."""
-        agg = aggressor.lower() if aggressor else 'unknown'
-        if agg in ('buy', 'bid'):
-            return Aggressor.BUY
-        if agg in ('sell', 'ask'):
-            return Aggressor.SELL
+# ================================================================
+# FASTAPI INTEGRATION
+# ================================================================
 
-        # Infer from bid/ask
-        if bid is not None and ask is not None:
-            if price >= ask:
-                return Aggressor.BUY
-            if price <= bid:
-                return Aggressor.SELL
-
-        return Aggressor.UNKNOWN
-
-    def _dispatch(self, symbol: str, record: TimeAndSalesRecord):
-        """Call registered callbacks (best-effort, never raises)."""
-        callbacks = []
-        with self._lock:
-            callbacks.extend(self._callbacks.get(symbol, []))
-            callbacks.extend(self._global_callbacks)
-
-        for cb in callbacks:
-            try:
-                cb(record)
-            except Exception:  # noqa: BLE001
-                logger.exception("Callback error for %s", symbol)
-
-
-# ────────────────────────────────────────────────────────────────────
-# FastAPI integration
-# ────────────────────────────────────────────────────────────────────
 
 def create_time_and_sales_router(service: TimeAndSalesService):
     """
-    Build a FastAPI router exposing time-and-sales endpoints.
+    Create FastAPI router with Time & Sales endpoints.
 
     Args:
-        service: :class:`TimeAndSalesService` instance.
+        service: TimeAndSalesService instance
 
     Returns:
-        ``fastapi.APIRouter``
+        FastAPI APIRouter
     """
     from fastapi import APIRouter, HTTPException
 
-    router = APIRouter(prefix="/api/tape", tags=["Time & Sales"])
+    router = APIRouter(prefix="/api/timesales", tags=["Time & Sales"])
 
-    @router.get("/{symbol}")
-    async def get_tape(symbol: str, limit: int = 100):
-        """Return the latest tape records."""
-        records = service.get_tape(symbol, limit=limit)
-        if not records:
-            raise HTTPException(status_code=404, detail=f"No tape data for {symbol}")
-        return [r.to_dict() for r in records]
+    @router.get("/{symbol}/recent")
+    async def get_recent_trades(symbol: str, n: int = 100):
+        """Get recent trades for a symbol."""
+        trades = service.get_recent_trades(symbol, n=n)
+        return [t.to_dict() for t in trades]
 
     @router.get("/{symbol}/large")
-    async def get_large_trades(symbol: str, limit: int = 50):
-        """Return recent large trades."""
-        records = service.get_large_trades(symbol, limit=limit)
-        return [r.to_dict() for r in records]
+    async def get_large_trades(
+        symbol: str, min_size: Optional[float] = None, lookback_minutes: int = 60
+    ):
+        """Get large trades for a symbol."""
+        trades = service.get_large_trades(
+            symbol, min_size=min_size, lookback_minutes=lookback_minutes
+        )
+        return [t.to_dict() for t in trades]
 
     @router.get("/{symbol}/velocity")
-    async def get_velocity(symbol: str, window: int = 60):
-        """Return trade velocity metrics."""
-        vel = service.get_velocity(symbol, window_seconds=window)
-        if vel is None:
-            raise HTTPException(status_code=404, detail=f"No tape data for {symbol}")
-        return vel.to_dict()
+    async def get_velocity(symbol: str, window_minutes: int = 5):
+        """Get trade velocity metrics."""
+        velocity = service.get_trade_velocity(symbol, window_minutes=window_minutes)
+        if not velocity:
+            raise HTTPException(status_code=404, detail=f"No data for {symbol}")
+        return velocity.to_dict()
 
-    @router.get("/{symbol}/statistics")
-    async def get_statistics(symbol: str, lookback: int = 3600):
-        """Return tape statistics."""
-        stats = service.get_statistics(symbol, lookback_seconds=lookback)
-        if stats is None:
-            raise HTTPException(status_code=404, detail=f"No tape data for {symbol}")
+    @router.get("/{symbol}/aggressor")
+    async def get_aggressor_stats(symbol: str, lookback_minutes: int = 60):
+        """Get aggressor statistics."""
+        stats = service.get_aggressor_stats(symbol, lookback_minutes=lookback_minutes)
+        if not stats:
+            raise HTTPException(status_code=404, detail=f"No data for {symbol}")
         return stats.to_dict()
 
-    @router.get("/")
-    async def list_symbols():
-        """Return all symbols with tape data."""
-        return {"symbols": service.get_symbols()}
+    @router.get("/{symbol}/histogram")
+    async def get_histogram(
+        symbol: str, bins: int = 20, lookback_minutes: int = 60
+    ):
+        """Get price/volume histogram."""
+        return service.get_trade_histogram(
+            symbol, bins=bins, lookback_minutes=lookback_minutes
+        )
 
-    @router.get("/stats/service")
-    async def service_stats():
-        """Return service diagnostics."""
+    @router.get("/{symbol}/statistics")
+    async def get_statistics(symbol: str, lookback_minutes: int = 60):
+        """Get trade statistics."""
+        return service.get_trade_statistics(
+            symbol, lookback_minutes=lookback_minutes
+        )
+
+    @router.get("/stats")
+    async def get_service_stats():
+        """Get service statistics."""
         return service.get_stats()
 
     return router
 
 
-# ────────────────────────────────────────────────────────────────────
-# Global singleton
-# ────────────────────────────────────────────────────────────────────
-_service: Optional[TimeAndSalesService] = None
+# Global instance
+_time_and_sales_service: Optional[TimeAndSalesService] = None
 
 
 def get_time_and_sales_service() -> TimeAndSalesService:
-    """Return the process-wide :class:`TimeAndSalesService` instance."""
-    global _service
-    if _service is None:
-        _service = TimeAndSalesService()
-    return _service
+    """Get the global Time & Sales service instance."""
+    global _time_and_sales_service
+    if _time_and_sales_service is None:
+        _time_and_sales_service = TimeAndSalesService()
+    return _time_and_sales_service

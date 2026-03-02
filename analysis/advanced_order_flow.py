@@ -1,247 +1,197 @@
 """
 Advanced Order Flow Analyzer
 
-Enhances analysis/order_flow.py with professional-grade metrics:
-- Aggression metrics (buy/sell aggression index)
-- Delta divergence detection (price vs. cumulative delta)
-- Volume cluster detection (support/resistance from volume density)
-- Stacked order-book imbalances
-- Exhaustion signals
-- FastAPI endpoints
-
-Integrates with:
-    analysis.order_flow       – base trade stream
-    data.depth_of_market      – order-book context
-    data.time_and_sales       – real-time tape
+Enhances the base OrderFlowAnalyzer with:
+- Real-time aggression metrics (bid vs ask aggressor)
+- Volume imbalance by price level
+- Stacked imbalances (consecutive price levels)
+- Delta divergence detection (price vs cumulative delta)
+- Volume clusters (support/resistance from volume)
+- Order flow oscillator
+- Buy/sell pressure gauges
+- Market absorption detection
 """
 
 import logging
 import math
-import threading
-from collections import defaultdict, deque
-from dataclasses import dataclass, field, asdict
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
-# ────────────────────────────────────────────────────────────────────
-# Constants
-# ────────────────────────────────────────────────────────────────────
-DEFAULT_LOOKBACK = 60           # minutes for standard analysis window
-DEFAULT_CLUSTER_BUCKETS = 30    # price buckets for cluster analysis
-DEFAULT_DIVERGENCE_BARS = 5     # bars to check for delta divergence
-DEFAULT_IMBALANCE_THRESHOLD = 0.4  # order book imbalance threshold
-DEFAULT_EXHAUSTION_RATIO = 0.85    # buy/sell ratio to flag exhaustion
 
-
-# ────────────────────────────────────────────────────────────────────
-# Data-classes
-# ────────────────────────────────────────────────────────────────────
 @dataclass
 class AggressionMetrics:
-    """Buy/sell aggression index for a symbol."""
+    """Buy vs sell aggression score for a symbol."""
+
     symbol: str
     timestamp: datetime
-    window_minutes: int
-
-    # Raw counts
-    total_trades: int
-    buy_trades: int
-    sell_trades: int
-    total_volume: float
-    buy_volume: float
-    sell_volume: float
-
-    # Aggression indices (0–100)
-    buy_aggression_index: float   # how aggressively buyers are lifting asks
-    sell_aggression_index: float  # how aggressively sellers are hitting bids
-
-    # Derived
-    aggression_ratio: float       # buy_agg / (buy_agg + sell_agg)
-    dominant_aggressor: str       # 'buyers' | 'sellers' | 'neutral'
+    buy_aggression: float  # 0-100
+    sell_aggression: float  # 0-100
+    aggression_score: float  # -100 (bearish) to +100 (bullish)
+    dominant_side: str
+    aggression_strength: str  # 'strong', 'moderate', 'weak'
 
     def to_dict(self) -> Dict:
-        d = asdict(self)
-        d['timestamp'] = self.timestamp.isoformat()
-        return d
-
-
-@dataclass
-class DeltaDivergenceSignal:
-    """Detected divergence between price direction and delta direction."""
-    symbol: str
-    timestamp: datetime
-    divergence_type: str          # 'bullish' | 'bearish'
-    price_direction: str          # 'up' | 'down'
-    delta_direction: str          # 'up' | 'down'
-    price_change: float
-    delta_change: float
-    confidence: float             # 0–1
-    description: str
-
-    def to_dict(self) -> Dict:
-        d = asdict(self)
-        d['timestamp'] = self.timestamp.isoformat()
-        return d
+        return {
+            "symbol": self.symbol,
+            "timestamp": self.timestamp.isoformat(),
+            "buy_aggression": self.buy_aggression,
+            "sell_aggression": self.sell_aggression,
+            "aggression_score": self.aggression_score,
+            "dominant_side": self.dominant_side,
+            "aggression_strength": self.aggression_strength,
+        }
 
 
 @dataclass
 class VolumeCluster:
-    """High-density volume cluster (support or resistance zone)."""
-    symbol: str
-    price_low: float
-    price_high: float
-    price_center: float
+    """A significant volume cluster acting as support or resistance."""
+
+    price_level: float
     total_volume: float
     buy_volume: float
     sell_volume: float
-    delta: float
     trade_count: int
-    cluster_type: str             # 'support' | 'resistance' | 'value_area'
-    strength: float               # 0–1
+    cluster_type: str  # 'support', 'resistance', 'neutral'
+    strength: float  # 0-1
 
     def to_dict(self) -> Dict:
-        return asdict(self)
+        return {
+            "price_level": self.price_level,
+            "total_volume": self.total_volume,
+            "buy_volume": self.buy_volume,
+            "sell_volume": self.sell_volume,
+            "trade_count": self.trade_count,
+            "cluster_type": self.cluster_type,
+            "strength": self.strength,
+        }
+
+
+@dataclass
+class DeltaDivergence:
+    """Delta divergence between price and cumulative delta."""
+
+    symbol: str
+    timestamp: datetime
+    divergence_type: str  # 'bullish', 'bearish'
+    price_direction: str  # 'up', 'down', 'flat'
+    delta_direction: str  # 'up', 'down', 'flat'
+    strength: float  # 0-1
+    confidence: float  # 0-1
+
+    def to_dict(self) -> Dict:
+        return {
+            "symbol": self.symbol,
+            "timestamp": self.timestamp.isoformat(),
+            "divergence_type": self.divergence_type,
+            "price_direction": self.price_direction,
+            "delta_direction": self.delta_direction,
+            "strength": self.strength,
+            "confidence": self.confidence,
+        }
+
+
+@dataclass
+class OrderFlowOscillator:
+    """Order flow oscillator value."""
+
+    symbol: str
+    timestamp: datetime
+    value: float  # -100 to +100
+    signal: str  # 'bullish', 'bearish', 'neutral'
+    overbought: bool
+    oversold: bool
+
+    def to_dict(self) -> Dict:
+        return {
+            "symbol": self.symbol,
+            "timestamp": self.timestamp.isoformat(),
+            "value": self.value,
+            "signal": self.signal,
+            "overbought": self.overbought,
+            "oversold": self.oversold,
+        }
 
 
 @dataclass
 class StackedImbalance:
-    """Three or more consecutive imbalanced price levels."""
+    """Multiple consecutive price levels with same-direction imbalance."""
+
     symbol: str
     timestamp: datetime
-    direction: str                # 'buy_stack' | 'sell_stack'
-    price_start: float
-    price_end: float
-    level_count: int
-    avg_imbalance: float
+    direction: str  # 'buy' or 'sell'
+    levels: List[float]  # Price levels in the stack
     total_volume: float
-    signal: str                   # 'bullish' | 'bearish'
-
-    def to_dict(self) -> Dict:
-        d = asdict(self)
-        d['timestamp'] = self.timestamp.isoformat()
-        return d
-
-
-@dataclass
-class AdvancedOrderFlowAnalysis:
-    """Full advanced analysis result."""
-    symbol: str
-    timestamp: datetime
-    window_minutes: int
-
-    # Aggression
-    aggression: AggressionMetrics
-
-    # Delta divergence (may be None)
-    delta_divergence: Optional[DeltaDivergenceSignal]
-
-    # Clusters
-    volume_clusters: List[VolumeCluster]
-    support_clusters: List[VolumeCluster]
-    resistance_clusters: List[VolumeCluster]
-
-    # Stacked imbalances
-    stacked_imbalances: List[StackedImbalance]
-
-    # Exhaustion flag
-    is_buy_exhaustion: bool
-    is_sell_exhaustion: bool
-
-    # Overall signal
-    signal: str         # 'bullish' | 'bearish' | 'neutral'
-    signal_strength: float  # 0–1
+    avg_imbalance: float
+    strength: str  # 'strong', 'moderate', 'weak'
 
     def to_dict(self) -> Dict:
         return {
-            'symbol': self.symbol,
-            'timestamp': self.timestamp.isoformat(),
-            'window_minutes': self.window_minutes,
-            'aggression': self.aggression.to_dict(),
-            'delta_divergence': (
-                self.delta_divergence.to_dict()
-                if self.delta_divergence else None
-            ),
-            'volume_clusters': [c.to_dict() for c in self.volume_clusters],
-            'support_clusters': [c.to_dict() for c in self.support_clusters],
-            'resistance_clusters': [c.to_dict() for c in self.resistance_clusters],
-            'stacked_imbalances': [s.to_dict() for s in self.stacked_imbalances],
-            'is_buy_exhaustion': self.is_buy_exhaustion,
-            'is_sell_exhaustion': self.is_sell_exhaustion,
-            'signal': self.signal,
-            'signal_strength': self.signal_strength,
+            "symbol": self.symbol,
+            "timestamp": self.timestamp.isoformat(),
+            "direction": self.direction,
+            "levels": self.levels,
+            "total_volume": self.total_volume,
+            "avg_imbalance": self.avg_imbalance,
+            "strength": self.strength,
         }
 
 
-# ────────────────────────────────────────────────────────────────────
-# Analyzer
-# ────────────────────────────────────────────────────────────────────
 class AdvancedOrderFlowAnalyzer:
     """
-    Enhanced order-flow analyzer with professional-grade metrics.
+    Advanced order flow analyzer with institutional-grade metrics.
 
-    Usage::
+    Extends the base order flow concept with:
+    - Aggression metrics (who is driving the market)
+    - Volume clusters for S/R levels
+    - Delta divergence detection
+    - Stacked imbalance identification
+    - Order flow oscillator
 
+    Usage:
         analyzer = AdvancedOrderFlowAnalyzer()
 
-        # Feed trades (identical interface to OrderFlowAnalyzer)
-        analyzer.add_trade('XAUUSD', price=1950.0, size=100.0, side='buy')
+        for trade in trades:
+            analyzer.add_trade('XAUUSD', trade['price'], trade['size'], trade['side'])
 
-        # Full analysis
-        result = analyzer.analyze('XAUUSD')
-
-        # Individual components
-        agg  = analyzer.get_aggression_metrics('XAUUSD')
-        divg = analyzer.get_delta_divergence('XAUUSD')
-        clus = analyzer.get_volume_clusters('XAUUSD')
+        metrics = analyzer.get_aggression_metrics('XAUUSD')
+        clusters = analyzer.get_volume_clusters('XAUUSD')
+        divergence = analyzer.detect_delta_divergence('XAUUSD')
     """
 
     def __init__(self, config: Optional[Dict] = None):
         """
-        Initialize the analyzer.
+        Initialize advanced analyzer.
 
         Args:
-            config: Optional overrides:
-                - lookback_minutes (int)
-                - cluster_buckets (int)
-                - divergence_bars (int)
-                - imbalance_threshold (float)
-                - exhaustion_ratio (float)
-                - max_trades (int)
+            config: Configuration options:
+                - tick_size: Minimum price increment (default 0.01)
+                - cluster_bins: Number of price bins for clustering (default 50)
+                - max_trades: Max trades per symbol (default 100000)
+                - imbalance_threshold: Ratio to flag imbalance (default 0.3)
+                - divergence_lookback: Bars for divergence calculation (default 20)
+                - oscillator_period: Trades to include in oscillator (default 100)
         """
-        cfg = config or {}
-        self._lookback: int = cfg.get('lookback_minutes', DEFAULT_LOOKBACK)
-        self._cluster_buckets: int = cfg.get('cluster_buckets', DEFAULT_CLUSTER_BUCKETS)
-        self._divergence_bars: int = cfg.get('divergence_bars', DEFAULT_DIVERGENCE_BARS)
-        self._imbalance_threshold: float = cfg.get('imbalance_threshold',
-                                                    DEFAULT_IMBALANCE_THRESHOLD)
-        self._exhaustion_ratio: float = cfg.get('exhaustion_ratio',
-                                                 DEFAULT_EXHAUSTION_RATIO)
-        self._max_trades: int = cfg.get('max_trades', 100_000)
+        self.config = config or {}
+        self._tick_size = self.config.get("tick_size", 0.01)
+        self._cluster_bins = self.config.get("cluster_bins", 50)
+        self._max_trades = self.config.get("max_trades", 100000)
+        self._imbalance_threshold = self.config.get("imbalance_threshold", 0.3)
+        self._divergence_lookback = self.config.get("divergence_lookback", 20)
+        self._oscillator_period = self.config.get("oscillator_period", 100)
 
-        # Storage: (timestamp, price, size, side)
-        self._trades: Dict[str, deque] = defaultdict(
-            lambda: deque(maxlen=self._max_trades)
-        )
+        # Trade storage: symbol -> list of (timestamp, price, size, side)
+        self._trades: Dict[str, List] = defaultdict(list)
+        self._cumulative_delta: Dict[str, float] = defaultdict(float)
 
-        # Cumulative delta per symbol
-        self._cum_delta: Dict[str, float] = defaultdict(float)
+        logger.info("Advanced Order Flow Analyzer initialized")
 
-        # Price & delta snapshots for divergence (per bar)
-        self._price_snapshots: Dict[str, deque] = defaultdict(
-            lambda: deque(maxlen=50)
-        )
-        self._delta_snapshots: Dict[str, deque] = defaultdict(
-            lambda: deque(maxlen=50)
-        )
-
-        self._lock = threading.RLock()
-        logger.info("AdvancedOrderFlowAnalyzer initialized")
-
-    # ────────────────────────────────────────────────────────────────
-    # Public write API
-    # ────────────────────────────────────────────────────────────────
+    # ================================================================
+    # TRADE MANAGEMENT
+    # ================================================================
 
     def add_trade(
         self,
@@ -250,543 +200,495 @@ class AdvancedOrderFlowAnalyzer:
         size: float,
         side: str,
         timestamp: Optional[datetime] = None,
-    ):
-        """
-        Add a single trade.
-
-        Args:
-            symbol:    Instrument ticker.
-            price:     Trade price.
-            size:      Trade size.
-            side:      'buy' or 'sell'.
-            timestamp: Trade time (UTC). Defaults to now.
-        """
+    ) -> None:
+        """Add a trade for analysis."""
         ts = timestamp or datetime.utcnow()
-        side = side.lower()
+        s = side.lower()
+        self._trades[symbol].append((ts, price, size, s))
+        delta = size if s == "buy" else -size
+        self._cumulative_delta[symbol] += delta
 
-        with self._lock:
-            self._trades[symbol].append((ts, price, size, side))
-            delta = size if side == 'buy' else -size
-            self._cum_delta[symbol] += delta
+        if len(self._trades[symbol]) > self._max_trades:
+            removed_ts, _, removed_size, removed_side = self._trades[symbol].pop(0)
+            adj = removed_size if removed_side == "buy" else -removed_size
+            self._cumulative_delta[symbol] -= adj
 
-    def add_trades(self, symbol: str, trades: List[Dict]):
-        """Batch-insert trades."""
-        for t in trades:
-            self.add_trade(
-                symbol=symbol,
-                price=t['price'],
-                size=t['size'],
-                side=t['side'],
-                timestamp=t.get('timestamp'),
-            )
+    def clear_trades(self, symbol: str) -> None:
+        """Clear trades for a symbol."""
+        self._trades.pop(symbol, None)
+        self._cumulative_delta.pop(symbol, None)
 
-    def snapshot(self, symbol: str, current_price: float):
-        """
-        Record a price/delta snapshot for divergence detection.
-
-        Call once per bar close.
-
-        Args:
-            symbol:        Instrument ticker.
-            current_price: Closing price of the bar.
-        """
-        with self._lock:
-            self._price_snapshots[symbol].append(current_price)
-            self._delta_snapshots[symbol].append(self._cum_delta[symbol])
-
-    # ────────────────────────────────────────────────────────────────
-    # Public read API – individual components
-    # ────────────────────────────────────────────────────────────────
+    # ================================================================
+    # AGGRESSION METRICS
+    # ================================================================
 
     def get_aggression_metrics(
         self,
         symbol: str,
-        window_minutes: Optional[int] = None,
+        lookback_minutes: int = 60,
     ) -> Optional[AggressionMetrics]:
-        """Compute buy/sell aggression metrics."""
-        window = window_minutes or self._lookback
-        cutoff = datetime.utcnow() - timedelta(minutes=window)
+        """
+        Calculate real-time buy/sell aggression metrics.
 
-        with self._lock:
-            recent = [r for r in self._trades[symbol] if r[0] >= cutoff]
+        Args:
+            symbol: Trading symbol
+            lookback_minutes: Lookback window
 
-        if not recent:
+        Returns:
+            AggressionMetrics or None
+        """
+        cutoff = datetime.utcnow() - timedelta(minutes=lookback_minutes)
+        trades = [t for t in self._trades.get(symbol, []) if t[0] >= cutoff]
+
+        if not trades:
             return None
 
-        buy_trades = [(p, s) for _, p, s, side in recent if side == 'buy']
-        sell_trades = [(p, s) for _, p, s, side in recent if side == 'sell']
-
-        buy_vol = sum(s for _, s in buy_trades)
-        sell_vol = sum(s for _, s in sell_trades)
+        buy_vol = sum(t[2] for t in trades if t[3] == "buy")
+        sell_vol = sum(t[2] for t in trades if t[3] == "sell")
         total_vol = buy_vol + sell_vol
 
-        # Aggression index: weighted by size relative to total
-        buy_agg = (buy_vol / total_vol * 100) if total_vol > 0 else 50.0
-        sell_agg = (sell_vol / total_vol * 100) if total_vol > 0 else 50.0
+        if total_vol == 0:
+            return None
 
-        total_agg = buy_agg + sell_agg
-        agg_ratio = (buy_agg / total_agg) if total_agg > 0 else 0.5
-
-        if agg_ratio > 0.55:
-            dominant = 'buyers'
-        elif agg_ratio < 0.45:
-            dominant = 'sellers'
-        else:
-            dominant = 'neutral'
+        buy_aggression = round(buy_vol / total_vol * 100, 2)
+        sell_aggression = round(sell_vol / total_vol * 100, 2)
+        # Score: +100 = fully buy dominated, -100 = fully sell dominated
+        score = round((buy_vol - sell_vol) / total_vol * 100, 2)
+        dominant = "buyers" if score > 0 else ("sellers" if score < 0 else "neutral")
+        abs_score = abs(score)
+        strength = (
+            "strong" if abs_score > 60 else ("moderate" if abs_score > 30 else "weak")
+        )
 
         return AggressionMetrics(
             symbol=symbol,
             timestamp=datetime.utcnow(),
-            window_minutes=window,
-            total_trades=len(recent),
-            buy_trades=len(buy_trades),
-            sell_trades=len(sell_trades),
-            total_volume=total_vol,
-            buy_volume=buy_vol,
-            sell_volume=sell_vol,
-            buy_aggression_index=round(buy_agg, 2),
-            sell_aggression_index=round(sell_agg, 2),
-            aggression_ratio=round(agg_ratio, 4),
-            dominant_aggressor=dominant,
+            buy_aggression=buy_aggression,
+            sell_aggression=sell_aggression,
+            aggression_score=score,
+            dominant_side=dominant,
+            aggression_strength=strength,
         )
 
-    def get_delta_divergence(
+    # ================================================================
+    # VOLUME IMBALANCE
+    # ================================================================
+
+    def get_volume_imbalance_by_level(
         self,
         symbol: str,
-    ) -> Optional[DeltaDivergenceSignal]:
+        price_bins: int = 20,
+        lookback_minutes: int = 60,
+    ) -> List[Dict]:
         """
-        Detect divergence between price direction and cumulative delta.
-
-        Requires at least *divergence_bars* snapshots via :meth:`snapshot`.
-        """
-        with self._lock:
-            prices = list(self._price_snapshots[symbol])
-            deltas = list(self._delta_snapshots[symbol])
-
-        n = self._divergence_bars
-        if len(prices) < n or len(deltas) < n:
-            return None
-
-        price_slice = prices[-n:]
-        delta_slice = deltas[-n:]
-
-        price_change = price_slice[-1] - price_slice[0]
-        delta_change = delta_slice[-1] - delta_slice[0]
-
-        price_dir = 'up' if price_change > 0 else 'down'
-        delta_dir = 'up' if delta_change > 0 else 'down'
-
-        # Divergence = price and delta move in opposite directions
-        if price_dir == delta_dir:
-            return None
-
-        if price_dir == 'up' and delta_dir == 'down':
-            div_type = 'bearish'
-            description = (
-                "Price making higher levels while delta is falling – "
-                "buyers may be losing momentum."
-            )
-        else:
-            div_type = 'bullish'
-            description = (
-                "Price making lower levels while delta is rising – "
-                "sellers may be exhausted."
-            )
-
-        # Confidence proportional to magnitude of divergence
-        if max(abs(price_change), 1e-9) > 0 and max(abs(delta_change), 1e-9) > 0:
-            confidence = min(1.0, abs(delta_change) / (abs(price_change) + 1e-9) * 0.1)
-        else:
-            confidence = 0.5
-
-        return DeltaDivergenceSignal(
-            symbol=symbol,
-            timestamp=datetime.utcnow(),
-            divergence_type=div_type,
-            price_direction=price_dir,
-            delta_direction=delta_dir,
-            price_change=round(price_change, 5),
-            delta_change=round(delta_change, 2),
-            confidence=round(min(confidence, 1.0), 3),
-            description=description,
-        )
-
-    def get_volume_clusters(
-        self,
-        symbol: str,
-        window_minutes: Optional[int] = None,
-        buckets: Optional[int] = None,
-    ) -> List[VolumeCluster]:
-        """
-        Identify high-density volume clusters.
+        Calculate volume imbalance at each price level.
 
         Args:
-            symbol:         Instrument ticker.
-            window_minutes: Look-back window.
-            buckets:        Number of price buckets.
+            symbol: Trading symbol
+            price_bins: Number of price buckets
+            lookback_minutes: Lookback window
 
         Returns:
-            List of :class:`VolumeCluster` sorted by total volume desc.
+            List of dicts with price/imbalance info per level
         """
-        window = window_minutes or self._lookback
-        n_buckets = buckets or self._cluster_buckets
-        cutoff = datetime.utcnow() - timedelta(minutes=window)
+        cutoff = datetime.utcnow() - timedelta(minutes=lookback_minutes)
+        trades = [t for t in self._trades.get(symbol, []) if t[0] >= cutoff]
 
-        with self._lock:
-            recent = [r for r in self._trades[symbol] if r[0] >= cutoff]
-
-        if len(recent) < 2:
+        if not trades:
             return []
 
-        prices = [r[1] for r in recent]
+        prices = [t[1] for t in trades]
         min_p, max_p = min(prices), max(prices)
-
         if min_p == max_p:
             return []
 
-        bucket_size = (max_p - min_p) / n_buckets
+        bucket = (max_p - min_p) / price_bins
+        levels: Dict[int, Dict] = {}
 
-        # Aggregate
-        agg: Dict[int, Dict] = defaultdict(lambda: {
-            'buy': 0.0, 'sell': 0.0, 'count': 0
-        })
-        for _, price, size, side in recent:
-            idx = int((price - min_p) / bucket_size)
-            idx = min(idx, n_buckets - 1)
-            agg[idx]['count'] += 1
-            if side == 'buy':
-                agg[idx]['buy'] += size
+        for ts, price, size, side in trades:
+            idx = min(int((price - min_p) / bucket), price_bins - 1)
+            if idx not in levels:
+                levels[idx] = {
+                    "price": round(min_p + (idx + 0.5) * bucket, 5),
+                    "buy_volume": 0.0,
+                    "sell_volume": 0.0,
+                }
+            if side == "buy":
+                levels[idx]["buy_volume"] += size
             else:
-                agg[idx]['sell'] += size
+                levels[idx]["sell_volume"] += size
 
-        total_vol = sum(
-            d['buy'] + d['sell'] for d in agg.values()
-        )
-        avg_vol = total_vol / n_buckets if n_buckets > 0 else 0
+        result = []
+        for idx in sorted(levels):
+            d = levels[idx]
+            total = d["buy_volume"] + d["sell_volume"]
+            imbalance = (
+                round((d["buy_volume"] - d["sell_volume"]) / total, 4)
+                if total > 0
+                else 0.0
+            )
+            result.append(
+                {
+                    "price": d["price"],
+                    "buy_volume": d["buy_volume"],
+                    "sell_volume": d["sell_volume"],
+                    "total_volume": total,
+                    "imbalance": imbalance,
+                }
+            )
 
-        # Determine current price for support/resistance classification
-        current_price = prices[-1] if prices else (min_p + max_p) / 2
-
-        clusters = []
-        for idx, data in agg.items():
-            bv = data['buy']
-            sv = data['sell']
-            tv = bv + sv
-            if tv < avg_vol * 1.5:
-                continue   # not a cluster
-
-            pl = min_p + idx * bucket_size
-            ph = pl + bucket_size
-            pc = (pl + ph) / 2
-            strength = min(1.0, tv / (avg_vol * 3))
-
-            if pc < current_price:
-                ctype = 'support'
-            elif pc > current_price:
-                ctype = 'resistance'
-            else:
-                ctype = 'value_area'
-
-            clusters.append(VolumeCluster(
-                symbol=symbol,
-                price_low=round(pl, 5),
-                price_high=round(ph, 5),
-                price_center=round(pc, 5),
-                total_volume=round(tv, 4),
-                buy_volume=round(bv, 4),
-                sell_volume=round(sv, 4),
-                delta=round(bv - sv, 4),
-                trade_count=data['count'],
-                cluster_type=ctype,
-                strength=round(strength, 3),
-            ))
-
-        return sorted(clusters, key=lambda c: -c.total_volume)
+        return result
 
     def get_stacked_imbalances(
         self,
         symbol: str,
-        window_minutes: Optional[int] = None,
-        min_stack: int = 3,
+        price_bins: int = 20,
+        lookback_minutes: int = 60,
+        min_stack_size: int = 3,
     ) -> List[StackedImbalance]:
         """
-        Detect stacked order-book imbalances.
-
-        A "stack" is ≥ *min_stack* consecutive price levels where the
-        buy/sell ratio exceeds the imbalance threshold in the same direction.
+        Detect stacked imbalances - consecutive levels with same-direction imbalance.
 
         Args:
-            symbol:         Instrument ticker.
-            window_minutes: Look-back window.
-            min_stack:      Minimum levels to qualify as a stack.
+            symbol: Trading symbol
+            price_bins: Number of price buckets
+            lookback_minutes: Lookback window
+            min_stack_size: Minimum consecutive levels to qualify
 
         Returns:
-            List of :class:`StackedImbalance`.
+            List of StackedImbalance objects
         """
-        clusters = self.get_volume_clusters(
-            symbol, window_minutes=window_minutes or self._lookback
+        imbalances = self.get_volume_imbalance_by_level(
+            symbol, price_bins=price_bins, lookback_minutes=lookback_minutes
         )
-        if len(clusters) < min_stack:
+
+        if not imbalances:
             return []
 
-        # Sort by price
-        sorted_clusters = sorted(clusters, key=lambda c: c.price_center)
+        results = []
+        current_stack: List[Dict] = []
+        current_dir: Optional[str] = None
 
-        stacks: List[StackedImbalance] = []
-        run: List[VolumeCluster] = []
-        run_dir: Optional[str] = None
-
-        def flush_run():
-            if len(run) >= min_stack:
-                total_vol = sum(c.total_volume for c in run)
-                avg_imb = sum(
-                    (c.buy_volume - c.sell_volume) / max(c.total_volume, 1e-9)
-                    for c in run
-                ) / len(run)
-                stacks.append(StackedImbalance(
+        def _flush_stack(stack: List[Dict], direction: str) -> None:
+            if len(stack) < min_stack_size:
+                return
+            prices = [s["price"] for s in stack]
+            total_vol = sum(s["total_volume"] for s in stack)
+            avg_imb = sum(abs(s["imbalance"]) for s in stack) / len(stack)
+            strength = (
+                "strong"
+                if avg_imb > 0.5
+                else ("moderate" if avg_imb > 0.25 else "weak")
+            )
+            results.append(
+                StackedImbalance(
                     symbol=symbol,
                     timestamp=datetime.utcnow(),
-                    direction=run_dir,
-                    price_start=run[0].price_low,
-                    price_end=run[-1].price_high,
-                    level_count=len(run),
+                    direction=direction,
+                    levels=prices,
+                    total_volume=total_vol,
                     avg_imbalance=round(avg_imb, 4),
-                    total_volume=round(total_vol, 4),
-                    signal='bullish' if run_dir == 'buy_stack' else 'bearish',
-                ))
+                    strength=strength,
+                )
+            )
 
-        for cluster in sorted_clusters:
-            tv = cluster.total_volume
-            if tv == 0:
-                flush_run(); run = []; run_dir = None
+        for level in imbalances:
+            imb = level["imbalance"]
+            if abs(imb) < self._imbalance_threshold:
+                if current_stack:
+                    _flush_stack(current_stack, current_dir or "buy")
+                current_stack = []
+                current_dir = None
                 continue
 
-            imb = (cluster.buy_volume - cluster.sell_volume) / tv
-            if imb >= self._imbalance_threshold:
-                direction = 'buy_stack'
-            elif imb <= -self._imbalance_threshold:
-                direction = 'sell_stack'
+            direction = "buy" if imb > 0 else "sell"
+            if direction != current_dir:
+                if current_stack:
+                    _flush_stack(current_stack, current_dir or "buy")
+                current_stack = [level]
+                current_dir = direction
             else:
-                flush_run(); run = []; run_dir = None
-                continue
+                current_stack.append(level)
 
-            if run_dir is None:
-                run_dir = direction
+        if current_stack:
+            _flush_stack(current_stack, current_dir or "buy")
 
-            if direction == run_dir:
-                run.append(cluster)
-            else:
-                flush_run()
-                run = [cluster]
-                run_dir = direction
+        return results
 
-        flush_run()
-        return stacks
+    # ================================================================
+    # DELTA DIVERGENCE
+    # ================================================================
 
-    # ────────────────────────────────────────────────────────────────
-    # Full analysis
-    # ────────────────────────────────────────────────────────────────
-
-    def analyze(
+    def detect_delta_divergence(
         self,
         symbol: str,
-        window_minutes: Optional[int] = None,
-    ) -> Optional[AdvancedOrderFlowAnalysis]:
+        lookback_minutes: int = 60,
+        segment_minutes: int = 5,
+    ) -> Optional[DeltaDivergence]:
         """
-        Run full advanced order-flow analysis.
+        Detect divergence between price direction and cumulative delta direction.
 
-        Returns *None* if there are no trades for the symbol.
+        A bullish divergence occurs when price falls but delta rises.
+        A bearish divergence occurs when price rises but delta falls.
+
+        Args:
+            symbol: Trading symbol
+            lookback_minutes: Total analysis window
+            segment_minutes: Time granularity for comparison
+
+        Returns:
+            DeltaDivergence or None
         """
-        window = window_minutes or self._lookback
+        cutoff = datetime.utcnow() - timedelta(minutes=lookback_minutes)
+        trades = [t for t in self._trades.get(symbol, []) if t[0] >= cutoff]
 
-        agg = self.get_aggression_metrics(symbol, window_minutes=window)
-        if agg is None:
+        if len(trades) < 10:
             return None
 
-        divergence = self.get_delta_divergence(symbol)
-        clusters = self.get_volume_clusters(symbol, window_minutes=window)
-        stacks = self.get_stacked_imbalances(symbol, window_minutes=window)
+        # Split into two halves and compare
+        mid = len(trades) // 2
+        first_half = trades[:mid]
+        second_half = trades[mid:]
 
-        support_clusters = [c for c in clusters if c.cluster_type == 'support']
-        resistance_clusters = [c for c in clusters if c.cluster_type == 'resistance']
+        def _half_stats(half: List) -> Tuple[float, float]:
+            avg_price = sum(t[1] for t in half) / len(half)
+            delta = sum(t[2] if t[3] == "buy" else -t[2] for t in half)
+            return avg_price, delta
 
-        # Exhaustion
-        exh_ratio = self._exhaustion_ratio
-        is_buy_exh = agg.buy_aggression_index >= exh_ratio * 100
-        is_sell_exh = agg.sell_aggression_index >= exh_ratio * 100
+        p1, d1 = _half_stats(first_half)
+        p2, d2 = _half_stats(second_half)
 
-        # Overall signal
-        signal, strength = self._compute_signal(
-            agg, divergence, stacks, is_buy_exh, is_sell_exh
+        price_dir = "up" if p2 > p1 else ("down" if p2 < p1 else "flat")
+        delta_dir = "up" if d2 > d1 else ("down" if d2 < d1 else "flat")
+
+        # No divergence if both move in same direction or either is flat
+        if price_dir == "flat" or delta_dir == "flat":
+            return None
+        if price_dir == delta_dir:
+            return None
+
+        # Bullish divergence: price down but delta up
+        # Bearish divergence: price up but delta down
+        divergence_type = (
+            "bullish" if price_dir == "down" and delta_dir == "up" else "bearish"
         )
 
-        return AdvancedOrderFlowAnalysis(
+        price_move = abs(p2 - p1) / p1 if p1 > 0 else 0.0
+        delta_move = abs(d2 - d1) / (abs(d1) + 1)
+        strength = min(1.0, (price_move * 1000 + delta_move) / 2)
+        confidence = min(1.0, len(trades) / 100)
+
+        return DeltaDivergence(
             symbol=symbol,
             timestamp=datetime.utcnow(),
-            window_minutes=window,
-            aggression=agg,
-            delta_divergence=divergence,
-            volume_clusters=clusters,
-            support_clusters=support_clusters,
-            resistance_clusters=resistance_clusters,
-            stacked_imbalances=stacks,
-            is_buy_exhaustion=is_buy_exh,
-            is_sell_exhaustion=is_sell_exh,
-            signal=signal,
-            signal_strength=round(strength, 3),
+            divergence_type=divergence_type,
+            price_direction=price_dir,
+            delta_direction=delta_dir,
+            strength=round(strength, 4),
+            confidence=round(confidence, 4),
         )
 
-    # ────────────────────────────────────────────────────────────────
-    # Private helpers
-    # ────────────────────────────────────────────────────────────────
+    # ================================================================
+    # VOLUME CLUSTERS
+    # ================================================================
 
-    def _compute_signal(
+    def get_volume_clusters(
         self,
-        agg: AggressionMetrics,
-        divergence: Optional[DeltaDivergenceSignal],
-        stacks: List[StackedImbalance],
-        buy_exh: bool,
-        sell_exh: bool,
-    ) -> Tuple[str, float]:
-        """Aggregate sub-signals into a single directional view."""
-        score = 0.0
+        symbol: str,
+        price_bins: int = 50,
+        lookback_minutes: int = 240,
+        current_price: Optional[float] = None,
+        top_n: int = 10,
+    ) -> List[VolumeCluster]:
+        """
+        Identify significant volume clusters acting as S/R levels.
 
-        # Aggression contribution (-1 … +1)
-        score += (agg.aggression_ratio - 0.5) * 2
+        Args:
+            symbol: Trading symbol
+            price_bins: Number of price buckets
+            lookback_minutes: Lookback window
+            current_price: Current market price for S/R classification
+            top_n: Return only top N clusters by volume
 
-        # Divergence (reversal signal)
-        if divergence:
-            div_weight = 0.5
-            if divergence.divergence_type == 'bullish':
-                score += div_weight * divergence.confidence
+        Returns:
+            List of VolumeCluster objects
+        """
+        cutoff = datetime.utcnow() - timedelta(minutes=lookback_minutes)
+        trades = [t for t in self._trades.get(symbol, []) if t[0] >= cutoff]
+
+        if not trades:
+            return []
+
+        prices = [t[1] for t in trades]
+        min_p, max_p = min(prices), max(prices)
+        if min_p == max_p:
+            return []
+
+        bucket = (max_p - min_p) / price_bins
+        bins: Dict[int, Dict] = {}
+
+        for ts, price, size, side in trades:
+            idx = min(int((price - min_p) / bucket), price_bins - 1)
+            if idx not in bins:
+                bins[idx] = {
+                    "price": round(min_p + (idx + 0.5) * bucket, 5),
+                    "total": 0.0,
+                    "buy": 0.0,
+                    "sell": 0.0,
+                    "count": 0,
+                }
+            bins[idx]["total"] += size
+            bins[idx]["count"] += 1
+            if side == "buy":
+                bins[idx]["buy"] += size
             else:
-                score -= div_weight * divergence.confidence
+                bins[idx]["sell"] += size
 
-        # Stacked imbalances
-        for stack in stacks:
-            w = min(stack.level_count / 10.0, 0.3)
-            if stack.direction == 'buy_stack':
-                score += w
-            else:
-                score -= w
+        if not bins:
+            return []
 
-        # Exhaustion reversal hints
-        if buy_exh:
-            score -= 0.2
-        if sell_exh:
-            score += 0.2
+        max_vol = max(b["total"] for b in bins.values())
+        avg_vol = sum(b["total"] for b in bins.values()) / len(bins)
 
-        # Normalise
-        strength = min(1.0, abs(score))
-        if score > 0.15:
-            return 'bullish', strength
-        if score < -0.15:
-            return 'bearish', strength
-        return 'neutral', strength
+        # Only significant clusters
+        significant = [b for b in bins.values() if b["total"] >= avg_vol * 1.5]
+        significant.sort(key=lambda x: -x["total"])
+        significant = significant[:top_n]
 
-    # ────────────────────────────────────────────────────────────────
-    # Utility
-    # ────────────────────────────────────────────────────────────────
+        cur = current_price or prices[-1]
+        clusters = []
+        for b in significant:
+            strength = round(b["total"] / max_vol, 4) if max_vol > 0 else 0.0
+            cluster_type = (
+                "support"
+                if b["price"] < cur
+                else ("resistance" if b["price"] > cur else "neutral")
+            )
+            clusters.append(
+                VolumeCluster(
+                    price_level=b["price"],
+                    total_volume=b["total"],
+                    buy_volume=b["buy"],
+                    sell_volume=b["sell"],
+                    trade_count=b["count"],
+                    cluster_type=cluster_type,
+                    strength=strength,
+                )
+            )
 
-    def get_symbols(self) -> List[str]:
-        """Return symbols with trade data."""
-        with self._lock:
-            return list(self._trades.keys())
+        return clusters
 
-    def clear_trades(self, symbol: str):
-        """Clear trade data for *symbol*."""
-        with self._lock:
-            self._trades.pop(symbol, None)
-            self._cum_delta.pop(symbol, None)
-            self._price_snapshots.pop(symbol, None)
-            self._delta_snapshots.pop(symbol, None)
+    # ================================================================
+    # ORDER FLOW OSCILLATOR
+    # ================================================================
+
+    def get_order_flow_oscillator(
+        self,
+        symbol: str,
+        period: Optional[int] = None,
+    ) -> Optional[OrderFlowOscillator]:
+        """
+        Calculate order flow oscillator from recent trades.
+
+        The oscillator measures cumulative buy pressure minus sell
+        pressure over the last ``period`` trades, normalised to -100/+100.
+
+        Args:
+            symbol: Trading symbol
+            period: Number of recent trades to use (defaults to config)
+
+        Returns:
+            OrderFlowOscillator or None
+        """
+        n = period or self._oscillator_period
+        trades = self._trades.get(symbol, [])[-n:]
+
+        if not trades:
+            return None
+
+        buy_vol = sum(t[2] for t in trades if t[3] == "buy")
+        sell_vol = sum(t[2] for t in trades if t[3] == "sell")
+        total_vol = buy_vol + sell_vol
+
+        if total_vol == 0:
+            return None
+
+        value = round((buy_vol - sell_vol) / total_vol * 100, 2)
+        signal = "bullish" if value > 20 else ("bearish" if value < -20 else "neutral")
+
+        return OrderFlowOscillator(
+            symbol=symbol,
+            timestamp=datetime.utcnow(),
+            value=value,
+            signal=signal,
+            overbought=value > 70,
+            oversold=value < -70,
+        )
+
+    # ================================================================
+    # PRESSURE GAUGES
+    # ================================================================
+
+    def get_pressure_gauges(
+        self,
+        symbol: str,
+        lookback_minutes: int = 15,
+    ) -> Optional[Dict]:
+        """
+        Get buy/sell pressure gauge readings.
+
+        Args:
+            symbol: Trading symbol
+            lookback_minutes: Lookback window
+
+        Returns:
+            Dict with buy_pressure and sell_pressure (0-100 each)
+        """
+        cutoff = datetime.utcnow() - timedelta(minutes=lookback_minutes)
+        trades = [t for t in self._trades.get(symbol, []) if t[0] >= cutoff]
+
+        if not trades:
+            return None
+
+        buy_vol = sum(t[2] for t in trades if t[3] == "buy")
+        sell_vol = sum(t[2] for t in trades if t[3] == "sell")
+        total_vol = buy_vol + sell_vol
+
+        if total_vol == 0:
+            return None
+
+        buy_pressure = round(buy_vol / total_vol * 100, 2)
+        sell_pressure = round(sell_vol / total_vol * 100, 2)
+
+        return {
+            "symbol": symbol,
+            "timestamp": datetime.utcnow().isoformat(),
+            "buy_pressure": buy_pressure,
+            "sell_pressure": sell_pressure,
+            "dominant": "buyers" if buy_pressure > sell_pressure else "sellers",
+        }
+
+    # ================================================================
+    # STATISTICS
+    # ================================================================
 
     def get_stats(self) -> Dict:
-        """Return service-level diagnostics."""
-        with self._lock:
-            return {
-                'symbols_tracked': len(self._trades),
-                'symbols': list(self._trades.keys()),
-                'trades_by_symbol': {
-                    s: len(buf) for s, buf in self._trades.items()
-                },
-                'cumulative_delta': dict(self._cum_delta),
-            }
+        """Get analyzer statistics."""
+        return {
+            "symbols_tracked": len(self._trades),
+            "symbols": list(self._trades.keys()),
+            "trade_counts": {s: len(t) for s, t in self._trades.items()},
+            "cumulative_deltas": dict(self._cumulative_delta),
+        }
 
 
-# ────────────────────────────────────────────────────────────────────
-# FastAPI integration
-# ────────────────────────────────────────────────────────────────────
-
-def create_advanced_order_flow_router(analyzer: AdvancedOrderFlowAnalyzer):
-    """
-    Build a FastAPI router exposing advanced order-flow endpoints.
-
-    Args:
-        analyzer: :class:`AdvancedOrderFlowAnalyzer` instance.
-
-    Returns:
-        ``fastapi.APIRouter``
-    """
-    from fastapi import APIRouter, HTTPException
-
-    router = APIRouter(prefix="/api/advanced-orderflow", tags=["Advanced Order Flow"])
-
-    @router.get("/{symbol}/analyze")
-    async def analyze(symbol: str, window_minutes: int = 60):
-        """Run full advanced order-flow analysis."""
-        result = analyzer.analyze(symbol, window_minutes=window_minutes)
-        if result is None:
-            raise HTTPException(status_code=404, detail=f"No data for {symbol}")
-        return result.to_dict()
-
-    @router.get("/{symbol}/aggression")
-    async def get_aggression(symbol: str, window_minutes: int = 60):
-        """Return aggression metrics."""
-        metrics = analyzer.get_aggression_metrics(symbol, window_minutes=window_minutes)
-        if metrics is None:
-            raise HTTPException(status_code=404, detail=f"No data for {symbol}")
-        return metrics.to_dict()
-
-    @router.get("/{symbol}/divergence")
-    async def get_divergence(symbol: str):
-        """Return delta divergence signal."""
-        div = analyzer.get_delta_divergence(symbol)
-        if div is None:
-            return {"symbol": symbol, "divergence": None}
-        return div.to_dict()
-
-    @router.get("/{symbol}/clusters")
-    async def get_clusters(symbol: str, window_minutes: int = 60):
-        """Return volume clusters."""
-        clusters = analyzer.get_volume_clusters(symbol, window_minutes=window_minutes)
-        return [c.to_dict() for c in clusters]
-
-    @router.get("/{symbol}/stacked-imbalances")
-    async def get_stacked_imbalances(symbol: str, window_minutes: int = 60):
-        """Return stacked imbalance zones."""
-        stacks = analyzer.get_stacked_imbalances(
-            symbol, window_minutes=window_minutes
-        )
-        return [s.to_dict() for s in stacks]
-
-    @router.get("/stats/service")
-    async def service_stats():
-        """Return service diagnostics."""
-        return analyzer.get_stats()
-
-    return router
-
-
-# ────────────────────────────────────────────────────────────────────
-# Global singleton
-# ────────────────────────────────────────────────────────────────────
-_analyzer: Optional[AdvancedOrderFlowAnalyzer] = None
+# Global instance
+_advanced_analyzer: Optional[AdvancedOrderFlowAnalyzer] = None
 
 
 def get_advanced_order_flow_analyzer() -> AdvancedOrderFlowAnalyzer:
-    """Return the process-wide :class:`AdvancedOrderFlowAnalyzer` instance."""
-    global _analyzer
-    if _analyzer is None:
-        _analyzer = AdvancedOrderFlowAnalyzer()
-    return _analyzer
+    """Get the global advanced order flow analyzer instance."""
+    global _advanced_analyzer
+    if _advanced_analyzer is None:
+        _advanced_analyzer = AdvancedOrderFlowAnalyzer()
+    return _advanced_analyzer

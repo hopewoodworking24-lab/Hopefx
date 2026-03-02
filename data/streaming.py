@@ -1,780 +1,563 @@
 """
 Real-Time Streaming Service
 
-WebSocket-based infrastructure for streaming market data:
+Event-driven, WebSocket-capable data streaming infrastructure with:
 - Multi-symbol subscription management
-- Event-driven architecture
-- Automatic reconnection with exponential back-off
-- Thread-safe publish/subscribe bus
-- Integration with TimeAndSalesService, DOM, and OrderFlow modules
-- FastAPI WebSocket endpoint
-
-This module does *not* depend on any specific broker; broker adapters
-push data via the public ``publish`` API.
+- Tick aggregation into bars
+- Reconnection logic
+- Pluggable data source adapters
+- Thread-safe publish/subscribe event bus
 """
 
-import asyncio
 import logging
 import threading
 import time
-from collections import defaultdict
-from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from collections import defaultdict, deque
+from datetime import datetime, timedelta
+from typing import Callable, Dict, List, Optional, Set
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
-# ────────────────────────────────────────────────────────────────────
-# Constants
-# ────────────────────────────────────────────────────────────────────
-DEFAULT_MAX_QUEUE = 10_000      # per-subscriber event queue depth
-DEFAULT_RECONNECT_BASE = 1.0   # seconds – first retry delay
-DEFAULT_RECONNECT_MAX = 60.0   # seconds – cap for exponential back-off
-DEFAULT_RECONNECT_FACTOR = 2.0 # multiplier
 
+class StreamStatus(Enum):
+    """Connection/stream status."""
 
-# ────────────────────────────────────────────────────────────────────
-# Enums & event types
-# ────────────────────────────────────────────────────────────────────
-class StreamEventType(str, Enum):
-    """Types of events published on the stream bus."""
-    TRADE = "trade"
-    QUOTE = "quote"
-    ORDER_BOOK = "order_book"
-    TICKER = "ticker"
-    HEARTBEAT = "heartbeat"
-    CONNECTION = "connection"
-    DISCONNECTION = "disconnection"
-    ERROR = "error"
-    CUSTOM = "custom"
-
-
-class ConnectionState(str, Enum):
-    """WebSocket connection lifecycle states."""
     DISCONNECTED = "disconnected"
     CONNECTING = "connecting"
     CONNECTED = "connected"
     RECONNECTING = "reconnecting"
-    CLOSED = "closed"
+    ERROR = "error"
 
 
-# ────────────────────────────────────────────────────────────────────
-# Data-classes
-# ────────────────────────────────────────────────────────────────────
 @dataclass
-class StreamEvent:
-    """A single event published to the event bus."""
-    event_type: StreamEventType
+class Tick:
+    """A single market tick."""
+
     symbol: str
-    data: Dict
-    timestamp: datetime = field(default_factory=datetime.utcnow)
-    source: str = "unknown"
-
-    def to_dict(self) -> Dict:
-        return {
-            'event_type': self.event_type.value,
-            'symbol': self.symbol,
-            'data': self.data,
-            'timestamp': self.timestamp.isoformat(),
-            'source': self.source,
-        }
-
-
-@dataclass
-class SubscriptionInfo:
-    """Metadata about a symbol subscription."""
-    symbol: str
-    event_types: Set[StreamEventType]
-    subscribed_at: datetime = field(default_factory=datetime.utcnow)
-    event_count: int = 0
-    last_event: Optional[datetime] = None
-
-    def to_dict(self) -> Dict:
-        return {
-            'symbol': self.symbol,
-            'event_types': [e.value for e in self.event_types],
-            'subscribed_at': self.subscribed_at.isoformat(),
-            'event_count': self.event_count,
-            'last_event': self.last_event.isoformat() if self.last_event else None,
-        }
-
-
-@dataclass
-class ConnectionStatus:
-    """Current state of a named stream connection."""
-    name: str
-    state: ConnectionState
-    url: Optional[str]
-    subscriptions: List[str]    # symbol list
-    connect_time: Optional[datetime]
-    reconnect_count: int
-    last_error: Optional[str]
-
-    def to_dict(self) -> Dict:
-        return {
-            'name': self.name,
-            'state': self.state.value,
-            'url': self.url,
-            'subscriptions': self.subscriptions,
-            'connect_time': (
-                self.connect_time.isoformat() if self.connect_time else None
-            ),
-            'reconnect_count': self.reconnect_count,
-            'last_error': self.last_error,
-        }
-
-
-# ────────────────────────────────────────────────────────────────────
-# Event bus (synchronous, thread-safe)
-# ────────────────────────────────────────────────────────────────────
-class EventBus:
-    """
-    Thread-safe synchronous publish/subscribe event bus.
-
-    Subscribers register callbacks; every ``publish`` call
-    dispatches the event to all matching subscribers.
-    """
-
-    def __init__(self):
-        # symbol -> event_type -> list[callback]
-        self._handlers: Dict[str, Dict[str, List[Callable]]] = defaultdict(
-            lambda: defaultdict(list)
-        )
-        # Global handlers (all symbols, all types)
-        self._global_handlers: List[Callable] = []
-        self._lock = threading.RLock()
-        self._stats: Dict[str, int] = defaultdict(int)
-
-    def subscribe(
-        self,
-        callback: Callable[[StreamEvent], None],
-        symbol: Optional[str] = None,
-        event_type: Optional[StreamEventType] = None,
-    ):
-        """
-        Register *callback* for matching events.
-
-        Args:
-            callback:   Function receiving :class:`StreamEvent`.
-            symbol:     Filter by symbol; ``None`` = all symbols.
-            event_type: Filter by event type; ``None`` = all types.
-        """
-        with self._lock:
-            if symbol is None and event_type is None:
-                self._global_handlers.append(callback)
-            else:
-                sym_key = symbol or '*'
-                type_key = event_type.value if event_type else '*'
-                self._handlers[sym_key][type_key].append(callback)
-
-    def unsubscribe(
-        self,
-        callback: Callable,
-        symbol: Optional[str] = None,
-        event_type: Optional[StreamEventType] = None,
-    ):
-        """Unregister a previously registered callback."""
-        with self._lock:
-            if symbol is None and event_type is None:
-                self._global_handlers = [
-                    c for c in self._global_handlers if c != callback
-                ]
-            else:
-                sym_key = symbol or '*'
-                type_key = event_type.value if event_type else '*'
-                if sym_key in self._handlers and type_key in self._handlers[sym_key]:
-                    self._handlers[sym_key][type_key] = [
-                        c for c in self._handlers[sym_key][type_key]
-                        if c != callback
-                    ]
-
-    def publish(self, event: StreamEvent):
-        """Dispatch *event* to all matching subscribers."""
-        self._stats['published'] += 1
-
-        with self._lock:
-            callbacks = list(self._global_handlers)
-            # Symbol-specific + wildcard
-            for sym_key in (event.symbol, '*'):
-                sym_handlers = self._handlers.get(sym_key, {})
-                # Event-type-specific + wildcard
-                for type_key in (event.event_type.value, '*'):
-                    callbacks.extend(sym_handlers.get(type_key, []))
-
-        for cb in callbacks:
-            try:
-                cb(event)
-                self._stats['delivered'] += 1
-            except Exception:  # noqa: BLE001
-                self._stats['errors'] += 1
-                logger.exception("EventBus callback error (%s/%s)",
-                                 event.symbol, event.event_type)
-
-    def get_stats(self) -> Dict:
-        return dict(self._stats)
-
-
-# ────────────────────────────────────────────────────────────────────
-# Stream connection (manages reconnection logic)
-# ────────────────────────────────────────────────────────────────────
-class StreamConnection:
-    """
-    Manages a single named WebSocket connection with auto-reconnect.
-
-    In production use a real WebSocket library (websockets, aiohttp,
-    etc.).  This class provides the lifecycle skeleton and reconnection
-    logic; subclass or inject a *connect_factory* to wire real I/O.
-    """
-
-    def __init__(
-        self,
-        name: str,
-        url: str,
-        event_bus: EventBus,
-        connect_factory: Optional[Callable] = None,
-        config: Optional[Dict] = None,
-    ):
-        """
-        Args:
-            name:            Human-readable connection identifier.
-            url:             WebSocket endpoint URL.
-            event_bus:       :class:`EventBus` to publish received events on.
-            connect_factory: Async callable ``(url) -> context-manager``
-                             yielding the raw WebSocket object.  When
-                             *None* the connection stays in CONNECTED
-                             state immediately (useful for testing).
-            config:          Optional reconnection overrides.
-        """
-        cfg = config or {}
-        self.name = name
-        self.url = url
-        self._bus = event_bus
-        self._factory = connect_factory
-
-        self._state = ConnectionState.DISCONNECTED
-        self._reconnect_count = 0
-        self._connect_time: Optional[datetime] = None
-        self._last_error: Optional[str] = None
-
-        self._reconnect_base: float = cfg.get('reconnect_base', DEFAULT_RECONNECT_BASE)
-        self._reconnect_max: float = cfg.get('reconnect_max', DEFAULT_RECONNECT_MAX)
-        self._reconnect_factor: float = cfg.get('reconnect_factor',
-                                                  DEFAULT_RECONNECT_FACTOR)
-
-        self._subscriptions: Set[str] = set()
-        self._stop_event = threading.Event()
-        self._lock = threading.RLock()
-
-    # ──────── public API ────────────────────────────────────────────
-
-    def subscribe(self, symbol: str):
-        """Add *symbol* to this connection's subscription set."""
-        with self._lock:
-            self._subscriptions.add(symbol)
-
-    def unsubscribe(self, symbol: str):
-        """Remove *symbol* from this connection's subscription set."""
-        with self._lock:
-            self._subscriptions.discard(symbol)
-
-    def start(self):
-        """Start the connection loop in a background daemon thread."""
-        self._stop_event.clear()
-        t = threading.Thread(target=self._run_loop, daemon=True,
-                             name=f"stream-{self.name}")
-        t.start()
-        logger.info("StreamConnection '%s' started", self.name)
-
-    def stop(self):
-        """Signal the connection loop to stop."""
-        self._stop_event.set()
-        with self._lock:
-            self._state = ConnectionState.CLOSED
-        logger.info("StreamConnection '%s' stopped", self.name)
+    timestamp: datetime
+    bid: float
+    ask: float
+    last: float
+    volume: float = 0.0
+    trade_id: Optional[str] = None
 
     @property
-    def state(self) -> ConnectionState:
-        return self._state
+    def mid(self) -> float:
+        return round((self.bid + self.ask) / 2, 5)
 
-    def get_status(self) -> ConnectionStatus:
-        with self._lock:
-            return ConnectionStatus(
-                name=self.name,
-                state=self._state,
-                url=self.url,
-                subscriptions=list(self._subscriptions),
-                connect_time=self._connect_time,
-                reconnect_count=self._reconnect_count,
-                last_error=self._last_error,
-            )
+    @property
+    def spread(self) -> float:
+        return round(self.ask - self.bid, 5)
 
-    # ──────── internal loop ─────────────────────────────────────────
-
-    def _run_loop(self):
-        """Reconnection loop executed in a background thread."""
-        delay = self._reconnect_base
-
-        while not self._stop_event.is_set():
-            try:
-                with self._lock:
-                    self._state = ConnectionState.CONNECTING
-
-                self._connect_time = datetime.utcnow()
-
-                if self._factory is None:
-                    # No real factory – just mark connected and idle
-                    with self._lock:
-                        self._state = ConnectionState.CONNECTED
-                    self._bus.publish(StreamEvent(
-                        event_type=StreamEventType.CONNECTION,
-                        symbol='*',
-                        data={'connection': self.name, 'url': self.url},
-                        source=self.name,
-                    ))
-                    # Wait until stop is requested
-                    self._stop_event.wait()
-                    break
-
-                # Real connection attempt (synchronous wrapper)
-                self._do_connect()
-
-                # Successful run – reset delay
-                delay = self._reconnect_base
-
-            except Exception as exc:  # noqa: BLE001
-                with self._lock:
-                    self._last_error = str(exc)
-                    self._reconnect_count += 1
-                    self._state = ConnectionState.RECONNECTING
-
-                logger.warning(
-                    "StreamConnection '%s' error (attempt %d): %s – "
-                    "retrying in %.1fs",
-                    self.name, self._reconnect_count, exc, delay,
-                )
-                self._bus.publish(StreamEvent(
-                    event_type=StreamEventType.ERROR,
-                    symbol='*',
-                    data={'connection': self.name, 'error': str(exc)},
-                    source=self.name,
-                ))
-
-                self._stop_event.wait(delay)
-                delay = min(delay * self._reconnect_factor, self._reconnect_max)
-
-    def _do_connect(self):
-        """
-        Placeholder for real WebSocket connection logic.
-
-        Override in subclasses or replace *_factory* for production use.
-        """
-        with self._lock:
-            self._state = ConnectionState.CONNECTED
-        # In a real implementation this would block until disconnected
-
-
-# ────────────────────────────────────────────────────────────────────
-# Streaming service (top-level orchestrator)
-# ────────────────────────────────────────────────────────────────────
-class StreamingService:
-    """
-    Orchestrates multiple :class:`StreamConnection` instances and
-    exposes a unified subscription/publish API.
-
-    Usage::
-
-        bus = EventBus()
-        service = StreamingService(event_bus=bus)
-
-        # Subscribe to all XAUUSD events
-        def on_trade(event):
-            print(event.to_dict())
-
-        service.subscribe('XAUUSD', on_trade,
-                          event_type=StreamEventType.TRADE)
-
-        # Add a named connection
-        service.add_connection('primary', 'wss://broker.example.com/stream')
-        service.start_connection('primary')
-
-        # Publish (broker adapters call this)
-        service.publish(StreamEvent(
-            event_type=StreamEventType.TRADE,
-            symbol='XAUUSD',
-            data={'price': 1950.0, 'size': 10.0, 'side': 'buy'},
-        ))
-    """
-
-    def __init__(
-        self,
-        event_bus: Optional[EventBus] = None,
-        config: Optional[Dict] = None,
-    ):
-        self._bus = event_bus or EventBus()
-        self._config = config or {}
-
-        # Named connections
-        self._connections: Dict[str, StreamConnection] = {}
-
-        # Symbol subscriptions metadata
-        self._subscriptions: Dict[str, SubscriptionInfo] = {}
-
-        self._lock = threading.RLock()
-        logger.info("StreamingService initialized")
-
-    # ──────── connection management ─────────────────────────────────
-
-    def add_connection(
-        self,
-        name: str,
-        url: str,
-        connect_factory: Optional[Callable] = None,
-        config: Optional[Dict] = None,
-    ) -> StreamConnection:
-        """
-        Register and return a named :class:`StreamConnection`.
-
-        Args:
-            name:            Unique connection name.
-            url:             WebSocket endpoint URL.
-            connect_factory: Optional async factory (see StreamConnection).
-            config:          Connection-level overrides.
-
-        Returns:
-            The created :class:`StreamConnection`.
-        """
-        conn = StreamConnection(
-            name=name,
-            url=url,
-            event_bus=self._bus,
-            connect_factory=connect_factory,
-            config=config or self._config,
-        )
-        with self._lock:
-            self._connections[name] = conn
-        logger.info("Connection '%s' added (%s)", name, url)
-        return conn
-
-    def start_connection(self, name: str):
-        """Start the named connection."""
-        with self._lock:
-            conn = self._connections.get(name)
-        if conn is None:
-            raise KeyError(f"Unknown connection: {name}")
-        conn.start()
-
-    def stop_connection(self, name: str):
-        """Stop the named connection."""
-        with self._lock:
-            conn = self._connections.get(name)
-        if conn:
-            conn.stop()
-
-    def start_all(self):
-        """Start all registered connections."""
-        with self._lock:
-            names = list(self._connections.keys())
-        for name in names:
-            self._connections[name].start()
-
-    def stop_all(self):
-        """Stop all registered connections."""
-        with self._lock:
-            names = list(self._connections.keys())
-        for name in names:
-            self._connections[name].stop()
-
-    def get_connection_status(self, name: str) -> Optional[ConnectionStatus]:
-        """Return status for a named connection."""
-        with self._lock:
-            conn = self._connections.get(name)
-        return conn.get_status() if conn else None
-
-    def get_all_connection_statuses(self) -> List[ConnectionStatus]:
-        """Return statuses for all connections."""
-        with self._lock:
-            conns = list(self._connections.values())
-        return [c.get_status() for c in conns]
-
-    # ──────── symbol subscriptions ──────────────────────────────────
-
-    def subscribe_symbol(
-        self,
-        symbol: str,
-        event_types: Optional[List[StreamEventType]] = None,
-        connection_name: Optional[str] = None,
-    ):
-        """
-        Subscribe to a symbol across connections.
-
-        Args:
-            symbol:          Instrument ticker.
-            event_types:     Event types to subscribe; *None* = all.
-            connection_name: Target specific connection; *None* = all.
-        """
-        et_set = set(event_types) if event_types else set(StreamEventType)
-        with self._lock:
-            if symbol not in self._subscriptions:
-                self._subscriptions[symbol] = SubscriptionInfo(
-                    symbol=symbol, event_types=et_set
-                )
-            else:
-                self._subscriptions[symbol].event_types.update(et_set)
-
-            target_conns = (
-                [self._connections[connection_name]]
-                if connection_name and connection_name in self._connections
-                else list(self._connections.values())
-            )
-
-        for conn in target_conns:
-            conn.subscribe(symbol)
-
-        logger.info("Subscribed to %s (%s)", symbol,
-                    [e.value for e in et_set])
-
-    def unsubscribe_symbol(
-        self,
-        symbol: str,
-        connection_name: Optional[str] = None,
-    ):
-        """Unsubscribe from a symbol."""
-        with self._lock:
-            self._subscriptions.pop(symbol, None)
-            target_conns = (
-                [self._connections[connection_name]]
-                if connection_name and connection_name in self._connections
-                else list(self._connections.values())
-            )
-
-        for conn in target_conns:
-            conn.unsubscribe(symbol)
-
-    def get_subscriptions(self) -> List[SubscriptionInfo]:
-        """Return all active subscriptions."""
-        with self._lock:
-            return list(self._subscriptions.values())
-
-    # ──────── event publishing / bus delegation ──────────────────────
-
-    def subscribe(
-        self,
-        symbol: Optional[str] = None,
-        callback: Optional[Callable[[StreamEvent], None]] = None,
-        event_type: Optional[StreamEventType] = None,
-    ):
-        """
-        Register *callback* on the internal event bus.
-
-        Positional form accepted for convenience::
-
-            service.subscribe('XAUUSD', my_handler, StreamEventType.TRADE)
-        """
-        self._bus.subscribe(callback, symbol=symbol, event_type=event_type)
-
-    def unsubscribe(
-        self,
-        callback: Callable,
-        symbol: Optional[str] = None,
-        event_type: Optional[StreamEventType] = None,
-    ):
-        """Unregister a callback."""
-        self._bus.unsubscribe(callback, symbol=symbol, event_type=event_type)
-
-    def publish(self, event: StreamEvent):
-        """
-        Publish an event to all matching subscribers.
-
-        Broker adapters call this method when they receive market data.
-        """
-        # Update subscription stats
-        with self._lock:
-            if event.symbol in self._subscriptions:
-                info = self._subscriptions[event.symbol]
-                info.event_count += 1
-                info.last_event = event.timestamp
-
-        self._bus.publish(event)
-
-    def publish_trade(
-        self,
-        symbol: str,
-        price: float,
-        size: float,
-        side: str,
-        source: str = "unknown",
-        timestamp: Optional[datetime] = None,
-        **kwargs: Any,
-    ):
-        """
-        Convenience method to publish a TRADE event.
-
-        Args:
-            symbol:    Instrument ticker.
-            price:     Execution price.
-            size:      Trade volume.
-            side:      'buy' or 'sell'.
-            source:    Data source identifier.
-            timestamp: Trade time; defaults to now.
-            **kwargs:  Extra data fields.
-        """
-        data = {'price': price, 'size': size, 'side': side, **kwargs}
-        self.publish(StreamEvent(
-            event_type=StreamEventType.TRADE,
-            symbol=symbol,
-            data=data,
-            timestamp=timestamp or datetime.utcnow(),
-            source=source,
-        ))
-
-    def publish_quote(
-        self,
-        symbol: str,
-        bid: float,
-        ask: float,
-        source: str = "unknown",
-        timestamp: Optional[datetime] = None,
-        **kwargs: Any,
-    ):
-        """Convenience method to publish a QUOTE event."""
-        data = {'bid': bid, 'ask': ask, **kwargs}
-        self.publish(StreamEvent(
-            event_type=StreamEventType.QUOTE,
-            symbol=symbol,
-            data=data,
-            timestamp=timestamp or datetime.utcnow(),
-            source=source,
-        ))
-
-    # ──────── service statistics ─────────────────────────────────────
-
-    def get_stats(self) -> Dict:
-        """Return service-level diagnostics."""
-        with self._lock:
-            subs = {
-                s: info.event_count
-                for s, info in self._subscriptions.items()
-            }
-            conn_states = {
-                name: conn.state.value
-                for name, conn in self._connections.items()
-            }
-
+    def to_dict(self) -> Dict:
         return {
-            'connections': conn_states,
-            'subscriptions_count': len(subs),
-            'events_by_symbol': subs,
-            'bus_stats': self._bus.get_stats(),
+            "symbol": self.symbol,
+            "timestamp": self.timestamp.isoformat(),
+            "bid": self.bid,
+            "ask": self.ask,
+            "last": self.last,
+            "volume": self.volume,
+            "trade_id": self.trade_id,
+            "mid": self.mid,
+            "spread": self.spread,
         }
 
 
-# ────────────────────────────────────────────────────────────────────
-# FastAPI / WebSocket integration
-# ────────────────────────────────────────────────────────────────────
+@dataclass
+class AggregatedBar:
+    """OHLCV bar aggregated from ticks."""
+
+    symbol: str
+    timeframe: str
+    timestamp: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    tick_count: int
+    buy_volume: float = 0.0
+    sell_volume: float = 0.0
+
+    def to_dict(self) -> Dict:
+        return {
+            "symbol": self.symbol,
+            "timeframe": self.timeframe,
+            "timestamp": self.timestamp.isoformat(),
+            "open": self.open,
+            "high": self.high,
+            "low": self.low,
+            "close": self.close,
+            "volume": self.volume,
+            "tick_count": self.tick_count,
+            "buy_volume": self.buy_volume,
+            "sell_volume": self.sell_volume,
+        }
+
+
+@dataclass
+class StreamEvent:
+    """An event published on the stream event bus."""
+
+    event_type: str  # 'tick', 'bar', 'connected', 'disconnected', 'error'
+    symbol: Optional[str]
+    timestamp: datetime
+    data: Dict = field(default_factory=dict)
+
+    def to_dict(self) -> Dict:
+        return {
+            "event_type": self.event_type,
+            "symbol": self.symbol,
+            "timestamp": self.timestamp.isoformat(),
+            "data": self.data,
+        }
+
+
+class TickAggregator:
+    """
+    Aggregates ticks into OHLCV bars for a given timeframe.
+
+    Supports multiple timeframes per symbol.
+    """
+
+    def __init__(self, timeframe_minutes: int = 1):
+        self._tf_minutes = timeframe_minutes
+        self._open_bars: Dict[str, Dict] = {}
+
+    def _bar_key(self, ts: datetime) -> datetime:
+        mins = (ts.minute // self._tf_minutes) * self._tf_minutes
+        return ts.replace(minute=mins, second=0, microsecond=0)
+
+    def add_tick(self, tick: Tick) -> Optional[AggregatedBar]:
+        """
+        Add a tick and return a completed bar if the bar period has closed.
+
+        Args:
+            tick: Incoming tick
+
+        Returns:
+            Completed AggregatedBar or None
+        """
+        bar_ts = self._bar_key(tick.timestamp)
+        key = tick.symbol
+
+        completed: Optional[AggregatedBar] = None
+
+        if key in self._open_bars and self._open_bars[key]["ts"] != bar_ts:
+            # Close the current bar
+            b = self._open_bars[key]
+            completed = AggregatedBar(
+                symbol=tick.symbol,
+                timeframe=f"{self._tf_minutes}m",
+                timestamp=b["ts"],
+                open=b["open"],
+                high=b["high"],
+                low=b["low"],
+                close=b["close"],
+                volume=b["volume"],
+                tick_count=b["count"],
+                buy_volume=b.get("buy_volume", 0.0),
+                sell_volume=b.get("sell_volume", 0.0),
+            )
+            del self._open_bars[key]
+
+        if key not in self._open_bars:
+            self._open_bars[key] = {
+                "ts": bar_ts,
+                "open": tick.last,
+                "high": tick.last,
+                "low": tick.last,
+                "close": tick.last,
+                "volume": tick.volume,
+                "buy_volume": 0.0,
+                "sell_volume": 0.0,
+                "count": 1,
+            }
+        else:
+            b = self._open_bars[key]
+            b["high"] = max(b["high"], tick.last)
+            b["low"] = min(b["low"], tick.last)
+            b["close"] = tick.last
+            b["volume"] += tick.volume
+            b["count"] += 1
+
+        return completed
+
+    def get_open_bar(self, symbol: str) -> Optional[Dict]:
+        """Get the currently open bar for a symbol."""
+        return self._open_bars.get(symbol)
+
+
+class StreamingService:
+    """
+    Real-time data streaming service.
+
+    Supports:
+    - Multi-symbol subscriptions
+    - Tick aggregation into configurable bars
+    - Event-driven publish/subscribe
+    - Reconnection logic with exponential backoff
+    - Thread-safe operation
+
+    Usage:
+        service = StreamingService()
+
+        # Subscribe to events
+        service.subscribe('XAUUSD', handler_fn)
+
+        # Simulate/inject a tick (for testing or adapters)
+        service.publish_tick(Tick('XAUUSD', datetime.utcnow(), 1950.0, 1950.1, 1950.05))
+    """
+
+    def __init__(self, config: Optional[Dict] = None):
+        """
+        Initialize streaming service.
+
+        Args:
+            config: Configuration options:
+                - max_ticks_buffer: Tick buffer size per symbol (default 10000)
+                - default_timeframes: Bar timeframes in minutes (default [1, 5, 15])
+                - reconnect_max_attempts: Max reconnection attempts (default 5)
+                - reconnect_base_delay: Base delay for backoff in seconds (default 2)
+        """
+        self.config = config or {}
+        self._max_ticks = self.config.get("max_ticks_buffer", 10000)
+        self._timeframes = self.config.get("default_timeframes", [1, 5, 15])
+        self._reconnect_max = self.config.get("reconnect_max_attempts", 5)
+        self._reconnect_base = self.config.get("reconnect_base_delay", 2)
+
+        # State
+        self._status = StreamStatus.DISCONNECTED
+        self._subscriptions: Dict[str, Set] = defaultdict(set)
+        self._global_listeners: List[Callable] = []
+
+        # Tick buffers per symbol
+        self._tick_buffers: Dict[str, deque] = {}
+
+        # Bar aggregators per timeframe
+        self._aggregators: Dict[int, TickAggregator] = {
+            tf: TickAggregator(tf) for tf in self._timeframes
+        }
+
+        # Completed bars per symbol per timeframe
+        self._bars: Dict[str, Dict[str, deque]] = defaultdict(
+            lambda: defaultdict(lambda: deque(maxlen=500))
+        )
+
+        # Thread safety
+        self._lock = threading.RLock()
+
+        logger.info("Streaming Service initialized, timeframes=%s", self._timeframes)
+
+    # ================================================================
+    # SUBSCRIPTION MANAGEMENT
+    # ================================================================
+
+    def subscribe(
+        self,
+        symbol: str,
+        callback: Callable[[StreamEvent], None],
+    ) -> None:
+        """
+        Subscribe to stream events for a symbol.
+
+        Args:
+            symbol: Trading symbol ('*' for all symbols)
+            callback: Callable receiving StreamEvent objects
+        """
+        with self._lock:
+            if symbol == "*":
+                self._global_listeners.append(callback)
+            else:
+                self._subscriptions[symbol].add(callback)
+        logger.debug("Subscribed to %s", symbol)
+
+    def unsubscribe(
+        self,
+        symbol: str,
+        callback: Callable[[StreamEvent], None],
+    ) -> None:
+        """Unsubscribe a callback from a symbol."""
+        with self._lock:
+            if symbol == "*":
+                self._global_listeners = [
+                    c for c in self._global_listeners if c is not callback
+                ]
+            else:
+                self._subscriptions[symbol].discard(callback)
+
+    def get_subscriptions(self) -> List[str]:
+        """Get list of subscribed symbols."""
+        with self._lock:
+            return list(self._subscriptions.keys())
+
+    # ================================================================
+    # TICK PUBLISHING
+    # ================================================================
+
+    def publish_tick(self, tick: Tick) -> None:
+        """
+        Publish a tick to all subscribers and run aggregation.
+
+        Args:
+            tick: Tick to publish
+        """
+        with self._lock:
+            if tick.symbol not in self._tick_buffers:
+                self._tick_buffers[tick.symbol] = deque(maxlen=self._max_ticks)
+            self._tick_buffers[tick.symbol].append(tick)
+
+            # Aggregate into bars
+            completed_bars = []
+            for tf, aggregator in self._aggregators.items():
+                bar = aggregator.add_tick(tick)
+                if bar is not None:
+                    self._bars[tick.symbol][bar.timeframe].append(bar)
+                    completed_bars.append(bar)
+
+        # Publish tick event
+        tick_event = StreamEvent(
+            event_type="tick",
+            symbol=tick.symbol,
+            timestamp=tick.timestamp,
+            data=tick.to_dict(),
+        )
+        self._dispatch(tick_event)
+
+        # Publish bar events
+        for bar in completed_bars:
+            bar_event = StreamEvent(
+                event_type="bar",
+                symbol=bar.symbol,
+                timestamp=bar.timestamp,
+                data=bar.to_dict(),
+            )
+            self._dispatch(bar_event)
+
+    def _dispatch(self, event: StreamEvent) -> None:
+        """Dispatch an event to all relevant subscribers."""
+        listeners: List[Callable] = []
+        with self._lock:
+            if event.symbol:
+                listeners = list(self._subscriptions.get(event.symbol, set()))
+            listeners.extend(self._global_listeners)
+
+        for cb in listeners:
+            try:
+                cb(event)
+            except Exception as exc:  # pragma: no cover
+                logger.error("Stream callback error: %s", exc)
+
+    # ================================================================
+    # DATA RETRIEVAL
+    # ================================================================
+
+    def get_recent_ticks(self, symbol: str, n: int = 100) -> List[Tick]:
+        """Get the most recent N ticks for a symbol."""
+        with self._lock:
+            buf = self._tick_buffers.get(symbol)
+            if buf is None:
+                return []
+            ticks = list(buf)
+        return ticks[-n:]
+
+    def get_bars(
+        self,
+        symbol: str,
+        timeframe: str = "1m",
+        limit: int = 100,
+    ) -> List[AggregatedBar]:
+        """
+        Get aggregated bars for a symbol.
+
+        Args:
+            symbol: Trading symbol
+            timeframe: Bar timeframe string (e.g. '1m', '5m', '15m')
+            limit: Maximum bars to return
+
+        Returns:
+            List of AggregatedBar objects (oldest first)
+        """
+        with self._lock:
+            bars = list(self._bars.get(symbol, {}).get(timeframe, []))
+        return bars[-limit:]
+
+    def get_latest_tick(self, symbol: str) -> Optional[Tick]:
+        """Get the most recent tick for a symbol."""
+        with self._lock:
+            buf = self._tick_buffers.get(symbol)
+            if not buf:
+                return None
+            return buf[-1]
+
+    # ================================================================
+    # CONNECTION STATUS
+    # ================================================================
+
+    @property
+    def status(self) -> StreamStatus:
+        return self._status
+
+    def connect(self) -> None:
+        """Mark the service as connected."""
+        self._status = StreamStatus.CONNECTED
+        event = StreamEvent(
+            event_type="connected",
+            symbol=None,
+            timestamp=datetime.utcnow(),
+        )
+        self._dispatch(event)
+        logger.info("Streaming Service connected")
+
+    def disconnect(self) -> None:
+        """Mark the service as disconnected."""
+        self._status = StreamStatus.DISCONNECTED
+        event = StreamEvent(
+            event_type="disconnected",
+            symbol=None,
+            timestamp=datetime.utcnow(),
+        )
+        self._dispatch(event)
+        logger.info("Streaming Service disconnected")
+
+    def reconnect_with_backoff(
+        self,
+        connect_fn: Callable,
+        max_attempts: Optional[int] = None,
+    ) -> bool:
+        """
+        Attempt to reconnect with exponential backoff.
+
+        Args:
+            connect_fn: Callable that attempts the connection; should return True on success
+            max_attempts: Override max reconnection attempts
+
+        Returns:
+            True if reconnection succeeded
+        """
+        attempts = max_attempts or self._reconnect_max
+        self._status = StreamStatus.RECONNECTING
+
+        for attempt in range(1, attempts + 1):
+            delay = self._reconnect_base * (2 ** (attempt - 1))
+            logger.info(
+                "Reconnection attempt %d/%d in %ds", attempt, attempts, delay
+            )
+            time.sleep(delay)
+            try:
+                if connect_fn():
+                    self._status = StreamStatus.CONNECTED
+                    logger.info("Reconnected successfully on attempt %d", attempt)
+                    return True
+            except Exception as exc:
+                logger.warning("Reconnection attempt %d failed: %s", attempt, exc)
+
+        self._status = StreamStatus.ERROR
+        logger.error("All %d reconnection attempts failed", attempts)
+        return False
+
+    # ================================================================
+    # UTILITY
+    # ================================================================
+
+    def get_stats(self) -> Dict:
+        """Get streaming service statistics."""
+        with self._lock:
+            return {
+                "status": self._status.value,
+                "subscribed_symbols": list(self._subscriptions.keys()),
+                "global_listeners": len(self._global_listeners),
+                "tick_buffer_sizes": {
+                    s: len(b) for s, b in self._tick_buffers.items()
+                },
+                "available_timeframes": [f"{tf}m" for tf in self._timeframes],
+            }
+
+    def clear_symbol(self, symbol: str) -> None:
+        """Clear buffered data for a symbol."""
+        with self._lock:
+            self._tick_buffers.pop(symbol, None)
+            self._bars.pop(symbol, None)
+
+    def clear_all(self) -> None:
+        """Clear all buffered data."""
+        with self._lock:
+            self._tick_buffers.clear()
+            self._bars.clear()
+
+
+# ================================================================
+# FASTAPI / WEBSOCKET INTEGRATION
+# ================================================================
+
 
 def create_streaming_router(service: StreamingService):
     """
-    Build a FastAPI router with streaming endpoints.
-
-    Includes a WebSocket endpoint that pushes events in real time.
+    Create FastAPI router with streaming endpoints and WebSocket support.
 
     Args:
-        service: :class:`StreamingService` instance.
+        service: StreamingService instance
 
     Returns:
-        ``fastapi.APIRouter``
+        FastAPI APIRouter
     """
-    from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+    from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
     import json
 
     router = APIRouter(prefix="/api/stream", tags=["Streaming"])
 
-    @router.get("/subscriptions")
-    async def list_subscriptions():
-        """Return active symbol subscriptions."""
-        return [s.to_dict() for s in service.get_subscriptions()]
-
-    @router.post("/subscribe/{symbol}")
-    async def subscribe_symbol(symbol: str):
-        """Subscribe to a symbol."""
-        service.subscribe_symbol(symbol)
-        return {"status": "subscribed", "symbol": symbol}
-
-    @router.delete("/subscribe/{symbol}")
-    async def unsubscribe_symbol(symbol: str):
-        """Unsubscribe from a symbol."""
-        service.unsubscribe_symbol(symbol)
-        return {"status": "unsubscribed", "symbol": symbol}
-
-    @router.get("/connections")
-    async def list_connections():
-        """Return status of all connections."""
-        return [c.to_dict() for c in service.get_all_connection_statuses()]
-
-    @router.get("/connections/{name}")
-    async def get_connection(name: str):
-        """Return status of a named connection."""
-        status = service.get_connection_status(name)
-        if status is None:
-            raise HTTPException(status_code=404,
-                                detail=f"Connection '{name}' not found")
-        return status.to_dict()
-
     @router.get("/stats")
-    async def stats():
-        """Return streaming service statistics."""
+    async def get_stats():
+        """Get streaming service statistics."""
         return service.get_stats()
 
-    @router.websocket("/ws/{symbol}")
+    @router.get("/{symbol}/ticks")
+    async def get_recent_ticks(symbol: str, n: int = 100):
+        """Get recent ticks for a symbol."""
+        ticks = service.get_recent_ticks(symbol, n=n)
+        return [t.to_dict() for t in ticks]
+
+    @router.get("/{symbol}/bars/{timeframe}")
+    async def get_bars(symbol: str, timeframe: str = "1m", limit: int = 100):
+        """Get aggregated bars for a symbol."""
+        bars = service.get_bars(symbol, timeframe=timeframe, limit=limit)
+        return [b.to_dict() for b in bars]
+
+    @router.websocket("/{symbol}/ws")
     async def websocket_stream(websocket: WebSocket, symbol: str):
-        """
-        WebSocket endpoint streaming events for *symbol*.
-
-        Connect with any standard WebSocket client::
-
-            ws://host/api/stream/ws/XAUUSD
-        """
+        """WebSocket endpoint for real-time tick streaming."""
         await websocket.accept()
-        queue: asyncio.Queue = asyncio.Queue(maxsize=DEFAULT_MAX_QUEUE)
-        loop = asyncio.get_event_loop()
+        queue = []
 
-        def on_event(event: StreamEvent):
-            try:
-                loop.call_soon_threadsafe(queue.put_nowait, event)
-            except Exception:  # noqa: BLE001
-                pass  # queue full – drop event
+        def on_event(event: StreamEvent) -> None:
+            queue.append(event.to_dict())
 
-        service.subscribe(symbol=symbol, callback=on_event)
-        service.subscribe_symbol(symbol)
-
+        service.subscribe(symbol, on_event)
         try:
             while True:
-                event = await asyncio.wait_for(queue.get(), timeout=30.0)
-                await websocket.send_text(json.dumps(event.to_dict()))
-        except asyncio.TimeoutError:
-            # Send heartbeat
-            await websocket.send_text(
-                json.dumps({'event_type': 'heartbeat', 'symbol': symbol,
-                            'timestamp': datetime.utcnow().isoformat()})
-            )
-        except WebSocketDisconnect:
+                # Drain queue
+                while queue:
+                    await websocket.send_text(json.dumps(queue.pop(0)))
+                # Small sleep to avoid busy-wait
+                import asyncio
+                await asyncio.sleep(0.01)
+        except (WebSocketDisconnect, Exception):
             pass
         finally:
-            service.unsubscribe(on_event, symbol=symbol)
+            service.unsubscribe(symbol, on_event)
 
     return router
 
 
-# ────────────────────────────────────────────────────────────────────
-# Global singleton
-# ────────────────────────────────────────────────────────────────────
-_service: Optional[StreamingService] = None
+# Global instance
+_streaming_service: Optional[StreamingService] = None
 
 
 def get_streaming_service() -> StreamingService:
-    """Return the process-wide :class:`StreamingService` instance."""
-    global _service
-    if _service is None:
-        _service = StreamingService()
-    return _service
+    """Get the global streaming service instance."""
+    global _streaming_service
+    if _streaming_service is None:
+        _streaming_service = StreamingService()
+    return _streaming_service

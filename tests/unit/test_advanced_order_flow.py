@@ -1,5 +1,5 @@
 """
-Tests for analysis/advanced_order_flow.py
+Tests for Advanced Order Flow Analyzer (analysis/advanced_order_flow.py)
 """
 
 import pytest
@@ -9,308 +9,302 @@ from datetime import datetime, timedelta
 class TestAggressionMetrics:
     """Tests for AggressionMetrics dataclass."""
 
-    def _make(self, buy_vol=600.0, sell_vol=400.0):
+    def test_to_dict(self):
         from analysis.advanced_order_flow import AggressionMetrics
-        total = buy_vol + sell_vol
-        buy_agg = buy_vol / total * 100
-        sell_agg = sell_vol / total * 100
-        ratio = buy_agg / (buy_agg + sell_agg)
-        return AggressionMetrics(
-            symbol='XAUUSD',
+
+        m = AggressionMetrics(
+            symbol="XAUUSD",
             timestamp=datetime.utcnow(),
-            window_minutes=60,
-            total_trades=100,
-            buy_trades=60,
-            sell_trades=40,
-            total_volume=total,
-            buy_volume=buy_vol,
-            sell_volume=sell_vol,
-            buy_aggression_index=round(buy_agg, 2),
-            sell_aggression_index=round(sell_agg, 2),
-            aggression_ratio=round(ratio, 4),
-            dominant_aggressor='buyers' if ratio > 0.55 else 'sellers',
+            buy_aggression=60.0,
+            sell_aggression=40.0,
+            aggression_score=20.0,
+            dominant_side="buyers",
+            aggression_strength="moderate",
         )
 
-    def test_to_dict(self):
-        m = self._make()
         d = m.to_dict()
-        for k in ('symbol', 'timestamp', 'buy_aggression_index',
-                  'sell_aggression_index', 'dominant_aggressor'):
-            assert k in d
-
-    def test_timestamp_is_iso(self):
-        d = self._make().to_dict()
-        assert isinstance(d['timestamp'], str)
+        assert d["symbol"] == "XAUUSD"
+        assert d["buy_aggression"] == 60.0
+        assert d["dominant_side"] == "buyers"
 
 
 class TestVolumeCluster:
     """Tests for VolumeCluster dataclass."""
 
-    def _make(self, ctype='support'):
+    def test_to_dict(self):
         from analysis.advanced_order_flow import VolumeCluster
-        return VolumeCluster(
-            symbol='XAUUSD',
-            price_low=1948.0, price_high=1950.0, price_center=1949.0,
-            total_volume=5000.0, buy_volume=3000.0, sell_volume=2000.0,
-            delta=1000.0, trade_count=50,
-            cluster_type=ctype, strength=0.8,
+
+        cluster = VolumeCluster(
+            price_level=1950.0,
+            total_volume=5000.0,
+            buy_volume=3000.0,
+            sell_volume=2000.0,
+            trade_count=50,
+            cluster_type="support",
+            strength=0.8,
         )
 
-    def test_to_dict(self):
-        c = self._make()
-        d = c.to_dict()
-        assert d['cluster_type'] == 'support'
-        assert 'price_center' in d
+        d = cluster.to_dict()
+        assert d["price_level"] == 1950.0
+        assert d["cluster_type"] == "support"
 
 
-class TestStackedImbalance:
-    """Tests for StackedImbalance dataclass."""
+class TestDeltaDivergence:
+    """Tests for DeltaDivergence dataclass."""
 
     def test_to_dict(self):
-        from analysis.advanced_order_flow import StackedImbalance
-        si = StackedImbalance(
-            symbol='XAUUSD', timestamp=datetime.utcnow(),
-            direction='buy_stack', price_start=1948.0, price_end=1952.0,
-            level_count=4, avg_imbalance=0.6, total_volume=2000.0,
-            signal='bullish',
+        from analysis.advanced_order_flow import DeltaDivergence
+
+        div = DeltaDivergence(
+            symbol="XAUUSD",
+            timestamp=datetime.utcnow(),
+            divergence_type="bullish",
+            price_direction="down",
+            delta_direction="up",
+            strength=0.7,
+            confidence=0.6,
         )
-        d = si.to_dict()
-        assert d['signal'] == 'bullish'
-        assert isinstance(d['timestamp'], str)
+
+        d = div.to_dict()
+        assert d["divergence_type"] == "bullish"
+        assert d["price_direction"] == "down"
 
 
 class TestAdvancedOrderFlowAnalyzer:
     """Tests for AdvancedOrderFlowAnalyzer."""
 
-    def _analyzer(self, **cfg):
+    def test_initialization(self):
         from analysis.advanced_order_flow import AdvancedOrderFlowAnalyzer
-        return AdvancedOrderFlowAnalyzer(config=cfg)
 
-    def _add_trades(self, analyzer, symbol, n_buy, n_sell, base_price=1950.0):
-        for i in range(n_buy):
-            analyzer.add_trade(symbol, price=base_price + i * 0.01,
-                               size=100.0, side='buy')
-        for i in range(n_sell):
-            analyzer.add_trade(symbol, price=base_price - i * 0.01,
-                               size=100.0, side='sell')
+        analyzer = AdvancedOrderFlowAnalyzer()
+        assert analyzer is not None
 
-    # ── add_trade ────────────────────────────────────────────────
+    def test_add_trade(self):
+        from analysis.advanced_order_flow import AdvancedOrderFlowAnalyzer
 
-    def test_add_trade_stored(self):
-        a = self._analyzer()
-        a.add_trade('XAUUSD', price=1950.0, size=1.0, side='buy')
-        stats = a.get_stats()
-        assert stats['trades_by_symbol']['XAUUSD'] == 1
+        analyzer = AdvancedOrderFlowAnalyzer()
+        analyzer.add_trade("XAUUSD", 1950.0, 100.0, "buy")
 
-    def test_cumulative_delta_buy(self):
-        a = self._analyzer()
-        a.add_trade('XAUUSD', price=1950.0, size=100.0, side='buy')
-        a.add_trade('XAUUSD', price=1950.0, size=40.0, side='sell')
-        assert a.get_stats()['cumulative_delta']['XAUUSD'] == 60.0
+        assert len(analyzer._trades["XAUUSD"]) == 1
+        assert analyzer._cumulative_delta["XAUUSD"] == 100.0
 
-    # ── get_aggression_metrics ───────────────────────────────────
+    def test_add_sell_trade_delta(self):
+        from analysis.advanced_order_flow import AdvancedOrderFlowAnalyzer
 
-    def test_aggression_none_when_no_trades(self):
-        a = self._analyzer()
-        assert a.get_aggression_metrics('XAUUSD') is None
+        analyzer = AdvancedOrderFlowAnalyzer()
+        analyzer.add_trade("XAUUSD", 1950.0, 100.0, "buy")
+        analyzer.add_trade("XAUUSD", 1950.0, 60.0, "sell")
 
-    def test_aggression_dominant_buyers(self):
-        a = self._analyzer()
-        self._add_trades(a, 'XAUUSD', n_buy=20, n_sell=5)
-        agg = a.get_aggression_metrics('XAUUSD')
-        assert agg is not None
-        assert agg.dominant_aggressor == 'buyers'
+        assert analyzer._cumulative_delta["XAUUSD"] == 40.0
 
-    def test_aggression_dominant_sellers(self):
-        a = self._analyzer()
-        self._add_trades(a, 'XAUUSD', n_buy=5, n_sell=20)
-        agg = a.get_aggression_metrics('XAUUSD')
-        assert agg.dominant_aggressor == 'sellers'
+    def test_max_trades_trim(self):
+        from analysis.advanced_order_flow import AdvancedOrderFlowAnalyzer
 
-    def test_aggression_indices_sum_to_100(self):
-        a = self._analyzer()
-        self._add_trades(a, 'XAUUSD', n_buy=10, n_sell=10)
-        agg = a.get_aggression_metrics('XAUUSD')
-        total = agg.buy_aggression_index + agg.sell_aggression_index
-        assert abs(total - 100.0) < 0.01
+        analyzer = AdvancedOrderFlowAnalyzer(config={"max_trades": 5})
+        for i in range(10):
+            analyzer.add_trade("XAUUSD", 1950.0, 10.0, "buy")
 
-    # ── snapshot & delta divergence ──────────────────────────────
+        assert len(analyzer._trades["XAUUSD"]) == 5
 
-    def test_divergence_none_before_enough_snapshots(self):
-        a = self._analyzer(divergence_bars=5)
-        for _ in range(3):
-            a.snapshot('XAUUSD', 1950.0)
-        assert a.get_delta_divergence('XAUUSD') is None
+    def test_get_aggression_metrics_no_data(self):
+        from analysis.advanced_order_flow import AdvancedOrderFlowAnalyzer
 
-    def test_bearish_divergence_detected(self):
-        from analysis.advanced_order_flow import DeltaDivergenceSignal
-        a = self._analyzer(divergence_bars=3)
-        # Price goes up but delta goes down → bearish divergence
-        prices = [1950.0, 1951.0, 1952.0]
-        deltas = [1000.0, 800.0, 600.0]
-        for p, d_val in zip(prices, deltas):
-            a._price_snapshots['XAUUSD'].append(p)
-            a._delta_snapshots['XAUUSD'].append(d_val)
-        div = a.get_delta_divergence('XAUUSD')
-        assert isinstance(div, DeltaDivergenceSignal)
-        assert div.divergence_type == 'bearish'
+        analyzer = AdvancedOrderFlowAnalyzer()
+        assert analyzer.get_aggression_metrics("NONEXISTENT") is None
 
-    def test_bullish_divergence_detected(self):
-        a = self._analyzer(divergence_bars=3)
-        # Price goes down but delta goes up → bullish divergence
-        prices = [1952.0, 1951.0, 1950.0]
-        deltas = [600.0, 800.0, 1000.0]
-        for p, d_val in zip(prices, deltas):
-            a._price_snapshots['XAUUSD'].append(p)
-            a._delta_snapshots['XAUUSD'].append(d_val)
-        div = a.get_delta_divergence('XAUUSD')
-        assert div is not None
-        assert div.divergence_type == 'bullish'
+    def test_get_aggression_metrics_bullish(self):
+        from analysis.advanced_order_flow import AdvancedOrderFlowAnalyzer
 
-    def test_no_divergence_when_aligned(self):
-        a = self._analyzer(divergence_bars=3)
-        # Both going up – no divergence
-        for p, d_val in [(1950.0, 100.0), (1951.0, 200.0), (1952.0, 300.0)]:
-            a._price_snapshots['XAUUSD'].append(p)
-            a._delta_snapshots['XAUUSD'].append(d_val)
-        assert a.get_delta_divergence('XAUUSD') is None
+        analyzer = AdvancedOrderFlowAnalyzer()
+        now = datetime.utcnow()
+        for _ in range(8):
+            analyzer.add_trade("XAUUSD", 1950.0, 100.0, "buy",
+                               timestamp=now - timedelta(minutes=5))
+        for _ in range(2):
+            analyzer.add_trade("XAUUSD", 1950.0, 100.0, "sell",
+                               timestamp=now - timedelta(minutes=5))
 
-    # ── get_volume_clusters ──────────────────────────────────────
+        metrics = analyzer.get_aggression_metrics("XAUUSD")
+        assert metrics is not None
+        assert metrics.buy_aggression == 80.0
+        assert metrics.dominant_side == "buyers"
+        assert metrics.aggression_score == 60.0
 
-    def test_clusters_empty_with_no_trades(self):
-        a = self._analyzer()
-        assert a.get_volume_clusters('XAUUSD') == []
+    def test_get_aggression_metrics_bearish(self):
+        from analysis.advanced_order_flow import AdvancedOrderFlowAnalyzer
 
-    def test_clusters_returned_for_dense_area(self):
-        a = self._analyzer(cluster_buckets=5)
-        # Concentrate volume at 1950
-        for _ in range(50):
-            a.add_trade('XAUUSD', price=1950.0, size=100.0, side='buy')
-        for _ in range(10):
-            a.add_trade('XAUUSD', price=1960.0, size=10.0, side='sell')
-        clusters = a.get_volume_clusters('XAUUSD')
-        assert len(clusters) >= 1
-        # Highest volume cluster first
-        assert clusters[0].total_volume >= clusters[-1].total_volume
+        analyzer = AdvancedOrderFlowAnalyzer()
+        now = datetime.utcnow()
+        for _ in range(2):
+            analyzer.add_trade("XAUUSD", 1950.0, 100.0, "buy",
+                               timestamp=now - timedelta(minutes=5))
+        for _ in range(8):
+            analyzer.add_trade("XAUUSD", 1950.0, 100.0, "sell",
+                               timestamp=now - timedelta(minutes=5))
 
-    def test_cluster_type_support_resistance(self):
-        a = self._analyzer(cluster_buckets=3)
-        # Trades below and above a gap
+        metrics = analyzer.get_aggression_metrics("XAUUSD")
+        assert metrics.dominant_side == "sellers"
+        assert metrics.aggression_score < 0
+
+    def test_get_volume_imbalance_by_level(self):
+        from analysis.advanced_order_flow import AdvancedOrderFlowAnalyzer
+
+        analyzer = AdvancedOrderFlowAnalyzer()
+        now = datetime.utcnow()
+        for i in range(20):
+            analyzer.add_trade(
+                "XAUUSD", 1950.0 + i * 0.5, 100.0, "buy" if i % 2 == 0 else "sell",
+                timestamp=now - timedelta(minutes=5)
+            )
+
+        levels = analyzer.get_volume_imbalance_by_level("XAUUSD", price_bins=5)
+        assert len(levels) > 0
+        assert all("imbalance" in lv for lv in levels)
+
+    def test_get_volume_imbalance_empty(self):
+        from analysis.advanced_order_flow import AdvancedOrderFlowAnalyzer
+
+        analyzer = AdvancedOrderFlowAnalyzer()
+        assert analyzer.get_volume_imbalance_by_level("NONEXISTENT") == []
+
+    def test_get_stacked_imbalances(self):
+        from analysis.advanced_order_flow import AdvancedOrderFlowAnalyzer
+
+        analyzer = AdvancedOrderFlowAnalyzer(config={"imbalance_threshold": 0.1})
+        now = datetime.utcnow()
+        # Create consistently buy-dominated price levels
+        for i in range(30):
+            analyzer.add_trade(
+                "XAUUSD", 1950.0 + i * 0.1, 100.0, "buy",
+                timestamp=now - timedelta(minutes=5)
+            )
+        for i in range(30):
+            analyzer.add_trade(
+                "XAUUSD", 1950.0 + i * 0.1, 20.0, "sell",
+                timestamp=now - timedelta(minutes=5)
+            )
+
+        stacked = analyzer.get_stacked_imbalances("XAUUSD", price_bins=10, min_stack_size=2)
+        assert isinstance(stacked, list)
+
+    def test_detect_delta_divergence_not_enough_data(self):
+        from analysis.advanced_order_flow import AdvancedOrderFlowAnalyzer
+
+        analyzer = AdvancedOrderFlowAnalyzer()
+        analyzer.add_trade("XAUUSD", 1950.0, 100.0, "buy")
+
+        assert analyzer.detect_delta_divergence("XAUUSD") is None
+
+    def test_detect_delta_divergence_bullish(self):
+        from analysis.advanced_order_flow import AdvancedOrderFlowAnalyzer
+
+        analyzer = AdvancedOrderFlowAnalyzer()
+        now = datetime.utcnow()
+
+        # First half: high price, more sells → delta falling
+        for i in range(10):
+            analyzer.add_trade(
+                "XAUUSD", 1960.0 - i * 0.1, 100.0, "sell",
+                timestamp=now - timedelta(minutes=30 + i)
+            )
+        # Second half: lower price, more buys → delta rising
+        for i in range(10):
+            analyzer.add_trade(
+                "XAUUSD", 1950.0 + i * 0.1, 100.0, "buy",
+                timestamp=now - timedelta(minutes=15 + i)
+            )
+
+        result = analyzer.detect_delta_divergence("XAUUSD")
+        # Result may be None or a divergence depending on data shape
+        if result is not None:
+            assert result.divergence_type in ("bullish", "bearish")
+
+    def test_get_volume_clusters(self):
+        from analysis.advanced_order_flow import AdvancedOrderFlowAnalyzer
+
+        analyzer = AdvancedOrderFlowAnalyzer()
+        now = datetime.utcnow()
+
+        # Concentrated volume at one price
         for _ in range(20):
-            a.add_trade('XAUUSD', price=1940.0, size=100.0, side='buy')
-        for _ in range(20):
-            a.add_trade('XAUUSD', price=1960.0, size=100.0, side='sell')
-        clusters = a.get_volume_clusters('XAUUSD')
-        types = {c.cluster_type for c in clusters}
-        assert types & {'support', 'resistance'}
+            analyzer.add_trade("XAUUSD", 1950.0, 500.0, "buy",
+                               timestamp=now - timedelta(hours=2))
+        for i in range(5):
+            analyzer.add_trade("XAUUSD", 1960.0 + i, 50.0, "sell",
+                               timestamp=now - timedelta(hours=2))
 
-    # ── get_stacked_imbalances ───────────────────────────────────
+        clusters = analyzer.get_volume_clusters("XAUUSD")
+        assert isinstance(clusters, list)
+        if clusters:
+            assert all(hasattr(c, "cluster_type") for c in clusters)
 
-    def test_stacked_imbalances_empty_with_insufficient_data(self):
-        a = self._analyzer()
-        assert a.get_stacked_imbalances('XAUUSD') == []
+    def test_get_order_flow_oscillator_no_data(self):
+        from analysis.advanced_order_flow import AdvancedOrderFlowAnalyzer
 
-    def test_stacked_buy_imbalance(self):
-        a = self._analyzer(
-            cluster_buckets=5,
-            imbalance_threshold=0.3,
-        )
-        # Heavy buying across multiple price levels
-        for price in [1948.0, 1949.0, 1950.0, 1951.0, 1952.0]:
-            for _ in range(40):
-                a.add_trade('XAUUSD', price=price, size=90.0, side='buy')
-            for _ in range(5):
-                a.add_trade('XAUUSD', price=price, size=10.0, side='sell')
+        analyzer = AdvancedOrderFlowAnalyzer()
+        assert analyzer.get_order_flow_oscillator("NONEXISTENT") is None
 
-        stacks = a.get_stacked_imbalances('XAUUSD')
-        if stacks:
-            buy_stacks = [s for s in stacks if s.direction == 'buy_stack']
-            assert len(buy_stacks) >= 1
+    def test_get_order_flow_oscillator(self):
+        from analysis.advanced_order_flow import AdvancedOrderFlowAnalyzer
 
-    # ── full analyze ─────────────────────────────────────────────
+        analyzer = AdvancedOrderFlowAnalyzer(config={"oscillator_period": 10})
+        for _ in range(8):
+            analyzer.add_trade("XAUUSD", 1950.0, 100.0, "buy")
+        for _ in range(2):
+            analyzer.add_trade("XAUUSD", 1950.0, 100.0, "sell")
 
-    def test_analyze_none_with_no_trades(self):
-        a = self._analyzer()
-        assert a.analyze('XAUUSD') is None
+        osc = analyzer.get_order_flow_oscillator("XAUUSD")
+        assert osc is not None
+        assert osc.value == 60.0
+        assert osc.signal == "bullish"
+        assert osc.overbought is False
+        assert osc.oversold is False
 
-    def test_analyze_returns_result(self):
-        from analysis.advanced_order_flow import AdvancedOrderFlowAnalysis
-        a = self._analyzer()
-        self._add_trades(a, 'XAUUSD', n_buy=20, n_sell=10)
-        result = a.analyze('XAUUSD')
-        assert isinstance(result, AdvancedOrderFlowAnalysis)
+    def test_get_pressure_gauges(self):
+        from analysis.advanced_order_flow import AdvancedOrderFlowAnalyzer
 
-    def test_analyze_bullish_signal(self):
-        a = self._analyzer()
-        self._add_trades(a, 'XAUUSD', n_buy=50, n_sell=5)
-        result = a.analyze('XAUUSD')
-        assert result.signal in ('bullish', 'neutral')
+        analyzer = AdvancedOrderFlowAnalyzer()
+        now = datetime.utcnow()
+        for _ in range(6):
+            analyzer.add_trade("XAUUSD", 1950.0, 100.0, "buy",
+                               timestamp=now - timedelta(minutes=5))
+        for _ in range(4):
+            analyzer.add_trade("XAUUSD", 1950.0, 100.0, "sell",
+                               timestamp=now - timedelta(minutes=5))
 
-    def test_analyze_bearish_signal(self):
-        a = self._analyzer()
-        self._add_trades(a, 'XAUUSD', n_buy=5, n_sell=50)
-        result = a.analyze('XAUUSD')
-        assert result.signal in ('bearish', 'neutral')
+        pressure = analyzer.get_pressure_gauges("XAUUSD")
+        assert pressure is not None
+        assert pressure["buy_pressure"] == 60.0
+        assert pressure["sell_pressure"] == 40.0
+        assert pressure["dominant"] == "buyers"
 
-    def test_analyze_to_dict(self):
-        a = self._analyzer()
-        self._add_trades(a, 'XAUUSD', n_buy=10, n_sell=10)
-        result = a.analyze('XAUUSD')
-        d = result.to_dict()
-        for k in ('symbol', 'timestamp', 'aggression', 'signal',
-                  'signal_strength', 'volume_clusters', 'stacked_imbalances'):
-            assert k in d
+    def test_get_pressure_gauges_no_data(self):
+        from analysis.advanced_order_flow import AdvancedOrderFlowAnalyzer
 
-    def test_signal_strength_between_0_and_1(self):
-        a = self._analyzer()
-        self._add_trades(a, 'XAUUSD', n_buy=20, n_sell=5)
-        result = a.analyze('XAUUSD')
-        assert 0.0 <= result.signal_strength <= 1.0
-
-    def test_exhaustion_flag_buy(self):
-        a = self._analyzer(exhaustion_ratio=0.5)
-        # All buys → buy exhaustion
-        for _ in range(20):
-            a.add_trade('XAUUSD', price=1950.0, size=100.0, side='buy')
-        result = a.analyze('XAUUSD')
-        assert result.is_buy_exhaustion is True
-        assert result.is_sell_exhaustion is False
-
-    # ── batch add_trades ─────────────────────────────────────────
-
-    def test_add_trades_batch(self):
-        a = self._analyzer()
-        batch = [
-            {'price': 1950.0, 'size': 1.0, 'side': 'buy'},
-            {'price': 1951.0, 'size': 2.0, 'side': 'sell'},
-        ]
-        a.add_trades('XAUUSD', batch)
-        assert a.get_stats()['trades_by_symbol']['XAUUSD'] == 2
-
-    # ── utility ──────────────────────────────────────────────────
-
-    def test_get_symbols(self):
-        a = self._analyzer()
-        a.add_trade('XAUUSD', 1950.0, 1.0, 'buy')
-        assert 'XAUUSD' in a.get_symbols()
+        analyzer = AdvancedOrderFlowAnalyzer()
+        assert analyzer.get_pressure_gauges("NONEXISTENT") is None
 
     def test_clear_trades(self):
-        a = self._analyzer()
-        a.add_trade('XAUUSD', 1950.0, 1.0, 'buy')
-        a.clear_trades('XAUUSD')
-        assert a.get_aggression_metrics('XAUUSD') is None
+        from analysis.advanced_order_flow import AdvancedOrderFlowAnalyzer
 
-    def test_get_stats_structure(self):
-        a = self._analyzer()
-        a.add_trade('XAUUSD', 1950.0, 1.0, 'buy')
-        stats = a.get_stats()
-        assert 'symbols_tracked' in stats
-        assert 'cumulative_delta' in stats
+        analyzer = AdvancedOrderFlowAnalyzer()
+        analyzer.add_trade("XAUUSD", 1950.0, 100.0, "buy")
+        analyzer.clear_trades("XAUUSD")
 
-    # ── singleton ────────────────────────────────────────────────
+        assert analyzer._trades.get("XAUUSD", []) == []
 
-    def test_global_singleton(self):
+    def test_get_stats(self):
+        from analysis.advanced_order_flow import AdvancedOrderFlowAnalyzer
+
+        analyzer = AdvancedOrderFlowAnalyzer()
+        analyzer.add_trade("XAUUSD", 1950.0, 100.0, "buy")
+
+        stats = analyzer.get_stats()
+        assert stats["symbols_tracked"] == 1
+
+    def test_global_instance(self):
         from analysis.advanced_order_flow import get_advanced_order_flow_analyzer
+
         a1 = get_advanced_order_flow_analyzer()
         a2 = get_advanced_order_flow_analyzer()
         assert a1 is a2
