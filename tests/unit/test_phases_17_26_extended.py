@@ -214,6 +214,9 @@ class TestNoCodeBuilderExtended:
         )
         assert rule is not None
         assert len(strategy.rules) == 1
+        # Verify rule properties
+        assert rule.name == 'RSI Oversold Buy'
+        assert rule.action.action_type.value == 'BUY'
 
     def test_add_rule_invalid_strategy(self, builder):
         rule = builder.add_rule('bad_id', 'Test Rule', [],
@@ -254,7 +257,8 @@ class TestNoCodeBuilderExtended:
 
     def test_export_invalid_strategy(self, builder):
         code = builder.export_to_python('bad_id')
-        assert code == '' or code is None or 'not found' in code.lower()
+        # Returns None or empty string when strategy not found
+        assert not code  # Falsy: None, '', or empty
 
     # --- get_available_indicators ---
 
@@ -392,9 +396,9 @@ class TestAIExplainabilityExtended:
     # --- get_model_performance_explanation ---
 
     def test_get_model_performance_no_data(self, explainer):
-        # May return a default ModelPerformanceExplanation even without data
+        # Returns a default ModelPerformanceExplanation with simulated data
         result = explainer.get_model_performance_explanation('UnknownModel')
-        assert result is not None or result is None  # Depends on impl
+        assert result is not None
 
     def test_get_model_performance_after_prediction(self, explainer, sample_features, mock_model):
         explainer.explain_prediction(
@@ -403,8 +407,10 @@ class TestAIExplainabilityExtended:
             prediction=1950.0,
             prediction_class='BUY',
         )
+        # Returns a ModelPerformanceExplanation with default simulated data
         result = explainer.get_model_performance_explanation('TestModel')
-        assert result is not None or result is None  # Depends on impl
+        assert result is not None
+        assert hasattr(result, 'accuracy')
 
     # --- compare_explanations ---
 
@@ -431,8 +437,9 @@ class TestAIExplainabilityExtended:
             current_prediction='BUY',
             target_prediction='SELL',
         )
-        assert result is not None
-        assert 'changes_needed' in result or isinstance(result, dict)
+        assert isinstance(result, dict)
+        assert 'changes_needed' in result
+        assert 'current_prediction' in result
 
     # --- get_feature_importance_chart_data ---
 
@@ -566,6 +573,7 @@ class TestResearchNotebooksExtended:
             template_id = t.get('template_id', t.get('id', ''))
             nb = engine.create_from_template(template_id, 'FromTemplate', 'tester')
             assert nb is not None
+            assert nb.title == 'FromTemplate'
 
     def test_create_from_template_invalid(self, engine):
         result = engine.create_from_template('bad_template', 'Test', 'tester')
@@ -614,21 +622,18 @@ class TestResearchNotebooksExtended:
         create_features = getattr(research_mod, 'create_features', None)
         if create_features is None:
             pytest.skip("create_features not exported")
-        try:
-            import pandas as pd
-            import numpy as np
-            dates = pd.date_range('2024-01-01', periods=50, freq='h')
-            df = pd.DataFrame({
-                'close': np.linspace(1900, 1950, 50),
-                'open': np.linspace(1895, 1945, 50),
-                'high': np.linspace(1905, 1955, 50),
-                'low': np.linspace(1890, 1940, 50),
-                'volume': np.random.randint(1000, 5000, 50).astype(float),
-            }, index=dates)
-            result = create_features(df)
-            assert result is not None
-        except Exception:
-            pass  # Feature function might need additional data
+        import pandas as pd
+        import numpy as np
+        dates = pd.date_range('2024-01-01', periods=50, freq='h')
+        df = pd.DataFrame({
+            'close': np.linspace(1900, 1950, 50),
+            'open': np.linspace(1895, 1945, 50),
+            'high': np.linspace(1905, 1955, 50),
+            'low': np.linspace(1890, 1940, 50),
+            'volume': np.random.randint(1000, 5000, 50).astype(float),
+        }, index=dates)
+        result = create_features(df)
+        assert result is not None
 
 
 # ===========================================================================
@@ -953,7 +958,7 @@ class TestTeamsExtended:
             strategy_id='strat_001',
             shared_by='owner1',
         )
-        assert result is True or result is not None
+        assert result is True
 
     def test_share_portfolio(self, manager, team_with_owner):
         result = manager.share_portfolio(
@@ -961,7 +966,7 @@ class TestTeamsExtended:
             portfolio_id='port_001',
             shared_by='owner1',
         )
-        assert result is True or result is not None
+        assert result is True
 
     # --- generate_api_key / verify_api_key ---
 
