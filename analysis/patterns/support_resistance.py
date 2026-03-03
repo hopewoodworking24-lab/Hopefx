@@ -1,5 +1,4 @@
-"""
-Support and Resistance Level Detection
+"""Support and Resistance Level Detection
 
 Identifies price levels where the market has historically found
 significant buying or selling pressure:
@@ -381,9 +380,13 @@ class SupportResistanceDetector:
         self.sensitivity: float = float(cfg.get("sensitivity", 0.003))
         self.swing_window: int = int(cfg.get("swing_window", 5))
         self.min_bars: int = int(cfg.get("min_bars", 30))
-        self.round_number_increment: float = float(
-            cfg.get("round_number_increment", 50.0)
-        )
+        round_number_increment = float(cfg.get("round_number_increment", 50.0))
+        if round_number_increment <= 0:
+            raise ValueError(
+                "round_number_increment must be greater than 0 to compute "
+                "round-number support/resistance levels."
+            )
+        self.round_number_increment: float = round_number_increment
         # Legacy attributes kept for backward compatibility
         self._window = self.swing_window
         self._tolerance_pct = self.sensitivity
@@ -400,8 +403,16 @@ class SupportResistanceDetector:
             if not isinstance(df, pd.DataFrame) or df.empty:
                 return None
         except ImportError:
-            pass
-        cols = {c.lower(): c for c in df.columns}
+            # pandas unavailable: fall back to duck-typing
+            if df is None or not hasattr(df, "columns"):
+                return None
+            is_empty = getattr(df, "empty", None)
+            if isinstance(is_empty, bool) and is_empty:
+                return None
+        try:
+            cols = {str(c).lower(): c for c in df.columns}
+        except Exception:
+            return None
         return cols
 
     def _tolerance_for(self, price: float) -> float:
@@ -442,6 +453,8 @@ class SupportResistanceDetector:
             return result
 
         closes = df[cols["close"]].tolist()
+        if len(closes) < self.min_bars:
+            return result
         if current_price is None:
             current_price = float(closes[-1]) if closes else 0.0
 
@@ -457,6 +470,7 @@ class SupportResistanceDetector:
 
         for level in all_levels:
             classification = self.classify_level(level, current_price)
+            level.level_type = classification
             result[classification].append(level)
 
         return result

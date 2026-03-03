@@ -1,5 +1,4 @@
-"""
-Candlestick Pattern Detection
+"""Candlestick Pattern Detection
 
 Identifies common single, dual, and multi-candlestick reversal and
 continuation patterns in OHLCV price data.
@@ -108,7 +107,13 @@ def _detect_hammer(
     doji_threshold: float = 0.05,
     wick_ratio: float = 2.0,
 ) -> Optional[CandlestickPattern]:
-    """Hammer / Hanging Man detection at index *i*."""
+    """Hammer / Hanging Man detection at index *i*.
+
+    Args:
+        doji_threshold: Maximum body/range ratio to still be considered a doji
+                        (candles at or below this ratio are excluded as dojis).
+        wick_ratio: Minimum ratio of lower shadow to body for a valid hammer.
+    """
     body = _candle_body(opens[i], closes[i])
     total = _candle_range(highs[i], lows[i])
     if total == 0:
@@ -148,7 +153,13 @@ def _detect_shooting_star(
     doji_threshold: float = 0.05,
     wick_ratio: float = 2.0,
 ) -> Optional[CandlestickPattern]:
-    """Shooting Star detection at index *i*."""
+    """Shooting Star detection at index *i*.
+
+    Args:
+        doji_threshold: Maximum body/range ratio to still be considered a doji
+                        (candles at or below this ratio are excluded as dojis).
+        wick_ratio: Minimum ratio of upper shadow to body for a valid shooting star.
+    """
     body = _candle_body(opens[i], closes[i])
     total = _candle_range(highs[i], lows[i])
     if total == 0:
@@ -186,7 +197,13 @@ def _detect_marubozu(
     i: int,
     marubozu_threshold: float = 0.05,
 ) -> Optional[CandlestickPattern]:
-    """Marubozu (almost no shadows) detection at index *i*."""
+    """Marubozu (almost no shadows) detection at index *i*.
+
+    Args:
+        marubozu_threshold: Maximum allowed shadow fraction; the body must
+                            occupy at least (1 - marubozu_threshold) of the
+                            total candle range.
+    """
     body = _candle_body(opens[i], closes[i])
     total = _candle_range(highs[i], lows[i])
     if total == 0:
@@ -225,7 +242,13 @@ def _detect_doji_pattern(
     i: int,
     doji_threshold: float = 0.05,
 ) -> Optional[CandlestickPattern]:
-    """Doji detection at index *i*."""
+    """Doji detection at index *i*.
+
+    Args:
+        doji_threshold: Maximum body/range ratio for a candle to be classified
+                        as a doji (body must be smaller than this fraction of
+                        the total high-to-low range).
+    """
     if not _is_doji(opens[i], closes[i], highs[i], lows[i], doji_threshold):
         return None
 
@@ -575,17 +598,12 @@ class CandlestickPatternDetector:
 
         Args:
             config: Optional dict with keys doji_threshold, wick_ratio,
-                    marubozu_threshold, max_patterns_per_type.
+                    marubozu_threshold.
         """
         cfg = config or {}
         self.doji_threshold: float = float(cfg.get("doji_threshold", 0.05))
         self.wick_ratio: float = float(cfg.get("wick_ratio", 2.0))
         self.marubozu_threshold: float = float(cfg.get("marubozu_threshold", 0.05))
-        self.max_patterns_per_type: Optional[int] = (
-            int(cfg["max_patterns_per_type"])
-            if "max_patterns_per_type" in cfg
-            else None
-        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -593,6 +611,11 @@ class CandlestickPatternDetector:
 
     def _get_ohlc(self, df: "pd.DataFrame"):
         """Extract OHLC lists from DataFrame; return None tuple on failure."""
+        if not HAS_PANDAS:
+            logger.warning(
+                "pandas is not available; DataFrame input cannot be processed."
+            )
+            return None, None, None, None
         if not isinstance(df, pd.DataFrame) or df.empty:
             return None, None, None, None
         cols = {c.lower(): c for c in df.columns}
@@ -625,6 +648,12 @@ class CandlestickPatternDetector:
         Returns:
             List of CandlestickPattern objects.
         """
+        if not HAS_PANDAS:
+            logger.warning(
+                "pandas is not available; detect_patterns cannot process "
+                "DataFrame input."
+            )
+            return []
         if not isinstance(df, pd.DataFrame) or df.empty:
             return []
         opens, highs, lows, closes = self._get_ohlc(df)
