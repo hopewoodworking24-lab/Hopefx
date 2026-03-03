@@ -1,60 +1,205 @@
 """
-Enhanced Drawing Tools for Charts
+Drawing Tools for Charts
 
-Phase 20: Provides professional-grade chart drawing tools including:
-- Trendlines and channels
-- Fibonacci retracements and extensions
-- Pitchfork (Andrews' Pitchfork)
-- Elliott wave annotations
-- Horizontal bands and vertical lines
-- Rectangle and text annotations
-- Drawing serialisation (to_dict / from_dict)
+Provides a toolkit for annotating price charts with trendlines,
+horizontal lines, rectangles, Fibonacci retracements, text labels,
+channels, arc/circle annotations, pitchforks, and Elliott Wave labels.
+
+All multi-parameter drawing methods accept a dedicated config dataclass
+to keep the public API clean and extensible.
 """
 
-from typing import Dict, List, Any, Optional
+from dataclasses import dataclass, field
 from datetime import datetime
-import logging
+from typing import Dict, List
 
-logger = logging.getLogger(__name__)
+# Default Fibonacci retracement and extension levels
+DEFAULT_FIB_LEVELS: List[float] = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
+DEFAULT_FIB_EXTENSIONS: List[float] = [1.272, 1.618, 2.0, 2.618]
 
+
+# ---------------------------------------------------------------------------
+# Drawing type constants
+# ---------------------------------------------------------------------------
 
 class DrawingType:
-    """Supported drawing types."""
+    """String constants for drawing type identifiers."""
+
     TRENDLINE = "trendline"
     HORIZONTAL_LINE = "horizontal_line"
     VERTICAL_LINE = "vertical_line"
     RECTANGLE = "rectangle"
-    HORIZONTAL_BAND = "horizontal_band"
-    FIBONACCI_RETRACEMENT = "fibonacci_retracement"
-    FIBONACCI_EXTENSION = "fibonacci_extension"
-    PITCHFORK = "pitchfork"
-    CHANNEL = "channel"
-    ELLIOTT_WAVE = "elliott_wave"
+    FIBONACCI = "fibonacci"
+    FIBONACCI_FAN = "fibonacci_fan"
+    FIBONACCI_ARC = "fibonacci_arc"
     TEXT = "text"
+    CHANNEL = "channel"
+    PITCHFORK = "pitchfork"
+    ELLIOTT_WAVE = "elliott_wave"
     ARROW = "arrow"
+    CIRCLE = "circle"
 
+
+# ---------------------------------------------------------------------------
+# Style / config dataclasses
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LineStyle:
+    """Visual style for line-based drawings."""
+
+    color: str = "#2196F3"
+    width: int = 1
+    dash: str = "solid"          # 'solid', 'dashed', 'dotted'
+    opacity: float = 1.0
+    extend: bool = False          # extend line beyond endpoints
+
+
+@dataclass
+class TrendlineConfig:
+    """Configuration for a trendline drawing."""
+
+    start_time: datetime
+    start_price: float
+    end_time: datetime
+    end_price: float
+    style: LineStyle = field(default_factory=LineStyle)
+    label: str = ""
+
+
+@dataclass
+class HorizontalLineConfig:
+    """Configuration for a horizontal line drawing."""
+
+    price: float
+    label: str = ""
+    style: LineStyle = field(default_factory=LineStyle)
+    extend_left: bool = True
+    extend_right: bool = True
+
+
+@dataclass
+class VerticalLineConfig:
+    """Configuration for a vertical line drawing."""
+
+    time: datetime
+    label: str = ""
+    style: LineStyle = field(default_factory=LineStyle)
+
+
+@dataclass
+class RectangleConfig:
+    """Configuration for a rectangle / zone drawing."""
+
+    start_time: datetime
+    end_time: datetime
+    top_price: float
+    bottom_price: float
+    fill_color: str = "#2196F380"
+    border_style: LineStyle = field(default_factory=LineStyle)
+    label: str = ""
+
+
+@dataclass
+class FibonacciConfig:
+    """Configuration for Fibonacci retracement / extension."""
+
+    start_time: datetime
+    start_price: float
+    end_time: datetime
+    end_price: float
+    levels: List[float] = field(
+        default_factory=lambda: list(DEFAULT_FIB_LEVELS)
+    )
+    extension_levels: List[float] = field(
+        default_factory=lambda: list(DEFAULT_FIB_EXTENSIONS)
+    )
+    style: LineStyle = field(default_factory=LineStyle)
+
+
+@dataclass
+class TextConfig:
+    """Configuration for a text annotation."""
+
+    time: datetime
+    price: float
+    text: str
+    font_size: int = 12
+    color: str = "#FFFFFF"
+    background: str = "#00000080"
+    anchor: str = "left"         # 'left', 'center', 'right'
+
+
+@dataclass
+class ChannelConfig:
+    """Configuration for a parallel channel drawing."""
+
+    start_time: datetime
+    start_price: float
+    end_time: datetime
+    end_price: float
+    channel_width: float         # price-distance between upper and lower band
+    style: LineStyle = field(default_factory=LineStyle)
+    label: str = ""
+
+
+@dataclass
+class PitchforkConfig:
+    """Configuration for an Andrews Pitchfork drawing."""
+
+    pivot_time: datetime
+    pivot_price: float
+    high_time: datetime
+    high_price: float
+    low_time: datetime
+    low_price: float
+    style: LineStyle = field(default_factory=LineStyle)
+
+
+@dataclass
+class ElliottWaveConfig:
+    """Configuration for an Elliott Wave annotation."""
+
+    points: List[Dict]           # [{'time': datetime, 'price': float}, ...]
+    wave_labels: List[str] = field(
+        default_factory=lambda: ["1", "2", "3", "4", "5"]
+    )
+    style: LineStyle = field(default_factory=LineStyle)
+    is_impulse: bool = True      # True = impulse, False = corrective (A-B-C)
+
+
+@dataclass
+class CircleConfig:
+    """Configuration for a circle / arc annotation."""
+
+    center_time: datetime
+    center_price: float
+    radius_bars: int = 5
+    radius_price: float = 0.0
+    style: LineStyle = field(default_factory=LineStyle)
+    label: str = ""
+
+
+@dataclass
+class ArrowConfig:
+    """Configuration for an arrow annotation."""
+
+    start_time: datetime
+    start_price: float
+    end_time: datetime
+    end_price: float
+    style: LineStyle = field(default_factory=LineStyle)
+    label: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Drawing object
+# ---------------------------------------------------------------------------
 
 class Drawing:
-    """
-    A single chart drawing object.
+    """Base drawing object stored in the toolkit."""
 
-    Attributes:
-        drawing_id: Unique identifier.
-        drawing_type: Type of drawing (see DrawingType).
-        properties: Drawing-specific properties dict.
-        visible: Whether the drawing is visible.
-        color: Drawing colour (hex or CSS name).
-        line_width: Line width in pixels.
-        created_at: Creation timestamp.
-    """
-
-    def __init__(
-        self,
-        drawing_type: str,
-        drawing_id: Optional[str] = None,
-        color: str = "#2196F3",
-        line_width: int = 1,
-    ):
+    def __init__(self, drawing_type: str):
         self.drawing_type = drawing_type
         self.drawing_id = drawing_id or f"{drawing_type}_{datetime.utcnow().timestamp()}"
         self.color = color
@@ -62,671 +207,389 @@ class Drawing:
         self.visible = True
         self.properties: Dict[str, Any] = {}
         self.created_at = datetime.utcnow()
+        self.properties: Dict = {}
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Serialise drawing to a dictionary."""
+    def to_dict(self) -> Dict:
         return {
-            "drawing_id": self.drawing_id,
             "drawing_type": self.drawing_type,
-            "color": self.color,
-            "line_width": self.line_width,
-            "visible": self.visible,
-            "properties": self.properties,
             "created_at": self.created_at.isoformat(),
+            "properties": self.properties,
         }
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Drawing":
-        """Deserialise a Drawing from a dictionary."""
-        obj = cls(
-            drawing_type=data["drawing_type"],
-            drawing_id=data.get("drawing_id"),
-            color=data.get("color", "#2196F3"),
-            line_width=data.get("line_width", 1),
-        )
-        obj.visible = data.get("visible", True)
-        obj.properties = data.get("properties", {})
-        return obj
 
-    def __repr__(self) -> str:
-        return f"Drawing(type={self.drawing_type!r}, id={self.drawing_id!r})"
-
+# ---------------------------------------------------------------------------
+# Toolkit
+# ---------------------------------------------------------------------------
 
 class DrawingToolkit:
     """
-    Professional chart drawing toolkit.
+    Toolkit for annotating price charts.
 
-    Provides methods to add, retrieve, show/hide, update and remove drawings.
-    All drawings are stored by their unique drawing_id so they can be
-    referenced later.
+    Each ``draw_*`` method accepts a typed config dataclass that groups
+    related parameters, keeping function signatures concise.
+
+    Usage::
+
+        toolkit = DrawingToolkit()
+        cfg = TrendlineConfig(start_time=t0, start_price=1800.0,
+                              end_time=t1, end_price=1850.0)
+        drawing = toolkit.draw_trendline(cfg)
     """
 
     def __init__(self):
         self.drawings: Dict[str, Drawing] = {}
 
     # ------------------------------------------------------------------
+    # Primitive helpers
+    # ------------------------------------------------------------------
+
+    def _store(self, drawing_id: str, drawing: Drawing) -> Drawing:
+        self.drawings[drawing_id] = drawing
+        return drawing
+
+    def _ts(self, dt: datetime) -> str:
+        return str(int(dt.timestamp() * 1000))
+
+    # ------------------------------------------------------------------
     # Trendline
     # ------------------------------------------------------------------
 
-    def draw_trendline(
-        self,
-        start_time: datetime,
-        start_price: float,
-        end_time: datetime,
-        end_price: float,
-        color: str = "#2196F3",
-        line_width: int = 1,
-        extend: bool = False,
-    ) -> Drawing:
+    def draw_trendline(self, config: TrendlineConfig) -> Drawing:
         """
-        Draw a trendline between two price/time coordinates.
+        Add a trendline annotation.
 
         Args:
-            start_time: Start timestamp.
-            start_price: Price at start.
-            end_time: End timestamp.
-            end_price: Price at end.
-            color: Line colour.
-            line_width: Line thickness.
-            extend: Whether to extend the line beyond end_time.
+            config: TrendlineConfig with start/end price-time coordinates
+                    and optional visual style.
 
         Returns:
             The created Drawing object.
         """
-        drawing = Drawing(DrawingType.TRENDLINE, color=color, line_width=line_width)
+        drawing = Drawing(DrawingType.TRENDLINE)
         drawing.properties = {
-            "start_time": start_time.isoformat() if isinstance(start_time, datetime) else start_time,
-            "start_price": start_price,
-            "end_time": end_time.isoformat() if isinstance(end_time, datetime) else end_time,
-            "end_price": end_price,
-            "extend": extend,
-            # slope = price change per second; clamped to minimum 1 second to
-            # avoid division-by-zero when start_time == end_time.
-            "slope": (end_price - start_price) / max(
-                (end_time - start_time).total_seconds(), 1
-            ) if isinstance(start_time, datetime) and isinstance(end_time, datetime) else 0,
+            "start_time": config.start_time,
+            "start_price": config.start_price,
+            "end_time": config.end_time,
+            "end_price": config.end_price,
+            "style": config.style,
+            "label": config.label,
         }
-        self.drawings[drawing.drawing_id] = drawing
-        logger.debug("Drew trendline %s", drawing.drawing_id)
-        return drawing
+        return self._store(f"TL_{self._ts(config.start_time)}", drawing)
 
     # ------------------------------------------------------------------
     # Horizontal line
     # ------------------------------------------------------------------
 
-    def draw_horizontal_line(
-        self,
-        price: float,
-        color: str = "#FF9800",
-        line_width: int = 1,
-        label: Optional[str] = None,
-        style: str = "solid",
-    ) -> Drawing:
+    def draw_horizontal_line(self, config: HorizontalLineConfig) -> Drawing:
         """
-        Draw a horizontal price level line.
+        Add a horizontal line at the given price.
 
         Args:
-            price: Price level.
-            color: Line colour.
-            line_width: Line thickness.
-            label: Optional text label.
-            style: Line style ('solid', 'dashed', 'dotted').
+            config: HorizontalLineConfig with price and display options.
 
         Returns:
             The created Drawing object.
         """
-        drawing = Drawing(DrawingType.HORIZONTAL_LINE, color=color, line_width=line_width)
+        drawing = Drawing(DrawingType.HORIZONTAL_LINE)
         drawing.properties = {
-            "price": price,
-            "label": label or f"{price:.5f}",
-            "style": style,
+            "price": config.price,
+            "label": config.label,
+            "style": config.style,
+            "extend_left": config.extend_left,
+            "extend_right": config.extend_right,
         }
-        self.drawings[drawing.drawing_id] = drawing
-        return drawing
+        return self._store(f"HL_{config.price}", drawing)
 
     # ------------------------------------------------------------------
     # Vertical line
     # ------------------------------------------------------------------
 
-    def draw_vertical_line(
-        self,
-        time: datetime,
-        color: str = "#9C27B0",
-        line_width: int = 1,
-        label: Optional[str] = None,
-        style: str = "dashed",
-    ) -> Drawing:
+    def draw_vertical_line(self, config: VerticalLineConfig) -> Drawing:
         """
-        Draw a vertical time marker.
+        Add a vertical line at the given timestamp.
 
         Args:
-            time: Timestamp of the vertical line.
-            color: Line colour.
-            line_width: Line thickness.
-            label: Optional text label.
-            style: Line style.
+            config: VerticalLineConfig with timestamp and style.
 
         Returns:
             The created Drawing object.
         """
-        drawing = Drawing(DrawingType.VERTICAL_LINE, color=color, line_width=line_width)
+        drawing = Drawing(DrawingType.VERTICAL_LINE)
         drawing.properties = {
-            "time": time.isoformat() if isinstance(time, datetime) else time,
-            "label": label or "",
-            "style": style,
+            "time": config.time,
+            "label": config.label,
+            "style": config.style,
         }
-        self.drawings[drawing.drawing_id] = drawing
-        return drawing
+        return self._store(f"VL_{self._ts(config.time)}", drawing)
 
     # ------------------------------------------------------------------
     # Rectangle
     # ------------------------------------------------------------------
 
-    def draw_rectangle(
-        self,
-        start_time: datetime,
-        start_price: float,
-        end_time: datetime,
-        end_price: float,
-        color: str = "#4CAF50",
-        fill_opacity: float = 0.1,
-    ) -> Drawing:
+    def draw_rectangle(self, config: RectangleConfig) -> Drawing:
         """
-        Draw a price/time rectangle (supply/demand zone, etc.).
+        Add a rectangle / price zone annotation.
 
         Args:
-            start_time: Top-left timestamp.
-            start_price: Top price level.
-            end_time: Bottom-right timestamp.
-            end_price: Bottom price level.
-            color: Border and fill colour.
-            fill_opacity: Fill opacity (0–1).
+            config: RectangleConfig with corner coordinates and fill colour.
 
         Returns:
             The created Drawing object.
         """
-        drawing = Drawing(DrawingType.RECTANGLE, color=color)
+        drawing = Drawing(DrawingType.RECTANGLE)
         drawing.properties = {
-            "start_time": start_time.isoformat() if isinstance(start_time, datetime) else start_time,
-            "start_price": start_price,
-            "end_time": end_time.isoformat() if isinstance(end_time, datetime) else end_time,
-            "end_price": end_price,
-            "fill_opacity": max(0.0, min(1.0, fill_opacity)),
+            "start_time": config.start_time,
+            "end_time": config.end_time,
+            "top_price": config.top_price,
+            "bottom_price": config.bottom_price,
+            "fill_color": config.fill_color,
+            "border_style": config.border_style,
+            "label": config.label,
         }
-        self.drawings[drawing.drawing_id] = drawing
-        return drawing
-
-    # ------------------------------------------------------------------
-    # Horizontal band
-    # ------------------------------------------------------------------
-
-    def draw_horizontal_band(
-        self,
-        upper_price: float,
-        lower_price: float,
-        color: str = "#FFC107",
-        fill_opacity: float = 0.15,
-        label: Optional[str] = None,
-    ) -> Drawing:
-        """
-        Draw a horizontal price band (e.g. support/resistance zone).
-
-        Args:
-            upper_price: Upper bound of the band.
-            lower_price: Lower bound of the band.
-            color: Band colour.
-            fill_opacity: Fill opacity (0–1).
-            label: Optional text label.
-
-        Returns:
-            The created Drawing object.
-        """
-        if upper_price < lower_price:
-            upper_price, lower_price = lower_price, upper_price
-        drawing = Drawing(DrawingType.HORIZONTAL_BAND, color=color)
-        drawing.properties = {
-            "upper_price": upper_price,
-            "lower_price": lower_price,
-            "fill_opacity": max(0.0, min(1.0, fill_opacity)),
-            "label": label or f"{lower_price:.5f} – {upper_price:.5f}",
-        }
-        self.drawings[drawing.drawing_id] = drawing
-        return drawing
+        return self._store(f"RECT_{self._ts(config.start_time)}", drawing)
 
     # ------------------------------------------------------------------
     # Fibonacci retracement
     # ------------------------------------------------------------------
 
-    def draw_fibonacci(
-        self,
-        start_time: datetime,
-        start_price: float,
-        end_time: datetime,
-        end_price: float,
-        levels: Optional[List[float]] = None,
-        color: str = "#FF5722",
-    ) -> Drawing:
+    def draw_fibonacci(self, config: FibonacciConfig) -> Drawing:
         """
-        Draw Fibonacci retracement levels.
-
-        The levels are computed as::
-
-            price_at_level = end_price - level * (end_price - start_price)
+        Add a Fibonacci retracement / extension drawing.
 
         Args:
-            start_time: Swing start timestamp.
-            start_price: Swing start price (e.g. swing low).
-            end_time: Swing end timestamp.
-            end_price: Swing end price (e.g. swing high).
-            levels: Fibonacci ratios to draw (default: standard set).
-            color: Line colour.
+            config: FibonacciConfig with anchor prices and level lists.
 
         Returns:
             The created Drawing object.
         """
-        if levels is None:
-            levels = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
-
-        price_range = end_price - start_price
-        level_prices = {
-            f"{int(lvl * 100)}%": end_price - lvl * price_range
-            for lvl in levels
-        }
-
-        drawing = Drawing(DrawingType.FIBONACCI_RETRACEMENT, color=color)
+        drawing = Drawing(DrawingType.FIBONACCI)
         drawing.properties = {
-            "start_time": start_time.isoformat() if isinstance(start_time, datetime) else start_time,
-            "start_price": start_price,
-            "end_time": end_time.isoformat() if isinstance(end_time, datetime) else end_time,
-            "end_price": end_price,
-            "levels": levels,
-            "level_prices": level_prices,
+            "start_time": config.start_time,
+            "start_price": config.start_price,
+            "end_time": config.end_time,
+            "end_price": config.end_price,
+            "levels": config.levels,
+            "extension_levels": config.extension_levels,
+            "style": config.style,
         }
-        self.drawings[drawing.drawing_id] = drawing
-        return drawing
+        return self._store(f"FIB_{self._ts(config.start_time)}", drawing)
 
     # ------------------------------------------------------------------
-    # Fibonacci extension
+    # Text label
     # ------------------------------------------------------------------
 
-    def draw_fibonacci_extension(
-        self,
-        point_a_time: datetime,
-        point_a_price: float,
-        point_b_time: datetime,
-        point_b_price: float,
-        point_c_time: datetime,
-        point_c_price: float,
-        levels: Optional[List[float]] = None,
-        color: str = "#E91E63",
-    ) -> Drawing:
+    def draw_text(self, config: TextConfig) -> Drawing:
         """
-        Draw Fibonacci extension levels (3-point tool).
-
-        Extension prices are calculated as::
-
-            price = point_c_price + level * (point_b_price - point_a_price)
+        Add a text annotation at the given price/time location.
 
         Args:
-            point_a_time: Point A timestamp.
-            point_a_price: Point A price.
-            point_b_time: Point B timestamp.
-            point_b_price: Point B price.
-            point_c_time: Point C timestamp.
-            point_c_price: Point C price (retracement end).
-            levels: Extension ratios (default: 1.272, 1.414, 1.618, 2.0, 2.618).
-            color: Line colour.
+            config: TextConfig with position and display options.
 
         Returns:
             The created Drawing object.
         """
-        if levels is None:
-            levels = [1.272, 1.414, 1.618, 2.0, 2.618]
-
-        swing = point_b_price - point_a_price
-        level_prices = {
-            f"{lvl:.3f}": point_c_price + lvl * swing
-            for lvl in levels
-        }
-
-        drawing = Drawing(DrawingType.FIBONACCI_EXTENSION, color=color)
+        drawing = Drawing(DrawingType.TEXT)
         drawing.properties = {
-            "point_a_time": point_a_time.isoformat() if isinstance(point_a_time, datetime) else point_a_time,
-            "point_a_price": point_a_price,
-            "point_b_time": point_b_time.isoformat() if isinstance(point_b_time, datetime) else point_b_time,
-            "point_b_price": point_b_price,
-            "point_c_time": point_c_time.isoformat() if isinstance(point_c_time, datetime) else point_c_time,
-            "point_c_price": point_c_price,
-            "levels": levels,
-            "level_prices": level_prices,
+            "time": config.time,
+            "price": config.price,
+            "text": config.text,
+            "font_size": config.font_size,
+            "color": config.color,
+            "background": config.background,
+            "anchor": config.anchor,
         }
-        self.drawings[drawing.drawing_id] = drawing
-        return drawing
+        return self._store(f"TXT_{self._ts(config.time)}_{config.text[:8]}", drawing)
 
     # ------------------------------------------------------------------
-    # Pitchfork (Andrews' Pitchfork)
+    # Channel
     # ------------------------------------------------------------------
 
-    def draw_pitchfork(
-        self,
-        pivot_time: datetime,
-        pivot_price: float,
-        high_time: datetime,
-        high_price: float,
-        low_time: datetime,
-        low_price: float,
-        color: str = "#00BCD4",
-    ) -> Drawing:
+    def draw_channel(self, config: ChannelConfig) -> Drawing:
         """
-        Draw an Andrews' Pitchfork from three pivot points.
-
-        The median line runs from the pivot to the midpoint of the
-        high and low handles.
+        Add a parallel channel (upper and lower trendlines).
 
         Args:
-            pivot_time: Handle pivot timestamp.
-            pivot_price: Handle pivot price.
-            high_time: Upper handle timestamp.
-            high_price: Upper handle price.
-            low_time: Lower handle timestamp.
-            low_price: Lower handle price.
-            color: Line colour.
+            config: ChannelConfig with anchor points and channel width.
 
         Returns:
             The created Drawing object.
         """
-        midpoint_price = (high_price + low_price) / 2.0
-
-        drawing = Drawing(DrawingType.PITCHFORK, color=color)
+        drawing = Drawing(DrawingType.CHANNEL)
         drawing.properties = {
-            "pivot_time": pivot_time.isoformat() if isinstance(pivot_time, datetime) else pivot_time,
-            "pivot_price": pivot_price,
-            "high_time": high_time.isoformat() if isinstance(high_time, datetime) else high_time,
-            "high_price": high_price,
-            "low_time": low_time.isoformat() if isinstance(low_time, datetime) else low_time,
-            "low_price": low_price,
-            "midpoint_price": midpoint_price,
+            "start_time": config.start_time,
+            "start_price": config.start_price,
+            "end_time": config.end_time,
+            "end_price": config.end_price,
+            "channel_width": config.channel_width,
+            "style": config.style,
+            "label": config.label,
         }
-        self.drawings[drawing.drawing_id] = drawing
-        return drawing
+        return self._store(f"CH_{self._ts(config.start_time)}", drawing)
 
     # ------------------------------------------------------------------
-    # Channel (parallel trendlines)
+    # Pitchfork
     # ------------------------------------------------------------------
 
-    def draw_channel(
-        self,
-        start_time: datetime,
-        start_price: float,
-        end_time: datetime,
-        end_price: float,
-        channel_width: float,
-        color: str = "#3F51B5",
-    ) -> Drawing:
+    def draw_pitchfork(self, config: PitchforkConfig) -> Drawing:
         """
-        Draw a price channel (two parallel trendlines).
+        Add an Andrews Pitchfork annotation.
 
         Args:
-            start_time: Channel start timestamp.
-            start_price: Centre-line start price.
-            end_time: Channel end timestamp.
-            end_price: Centre-line end price.
-            channel_width: Half-width of the channel in price units.
-            color: Line colour.
+            config: PitchforkConfig with pivot and two swing points.
 
         Returns:
             The created Drawing object.
         """
-        drawing = Drawing(DrawingType.CHANNEL, color=color)
+        drawing = Drawing(DrawingType.PITCHFORK)
         drawing.properties = {
-            "start_time": start_time.isoformat() if isinstance(start_time, datetime) else start_time,
-            "start_price": start_price,
-            "end_time": end_time.isoformat() if isinstance(end_time, datetime) else end_time,
-            "end_price": end_price,
-            "channel_width": channel_width,
-            "upper_start": start_price + channel_width,
-            "upper_end": end_price + channel_width,
-            "lower_start": start_price - channel_width,
-            "lower_end": end_price - channel_width,
+            "pivot_time": config.pivot_time,
+            "pivot_price": config.pivot_price,
+            "high_time": config.high_time,
+            "high_price": config.high_price,
+            "low_time": config.low_time,
+            "low_price": config.low_price,
+            "style": config.style,
         }
-        self.drawings[drawing.drawing_id] = drawing
-        return drawing
+        return self._store(f"PF_{self._ts(config.pivot_time)}", drawing)
 
     # ------------------------------------------------------------------
-    # Elliott Wave annotation
+    # Elliott Wave
     # ------------------------------------------------------------------
 
-    def draw_elliott_wave(
-        self,
-        wave_points: List[Dict[str, Any]],
-        wave_type: str = "impulse",
-        color: str = "#8BC34A",
-    ) -> Drawing:
+    def draw_elliott_wave(self, config: ElliottWaveConfig) -> Drawing:
         """
-        Annotate Elliott Wave pivots on the chart.
+        Add an Elliott Wave label sequence.
 
         Args:
-            wave_points: List of dicts with keys ``time``, ``price``,
-                         and ``label`` (e.g. '1', '2', …, '5' or 'A', 'B', 'C').
-            wave_type: 'impulse' or 'corrective'.
-            color: Line colour.
-
-        Returns:
-            The created Drawing object.
-
-        Raises:
-            ValueError: If fewer than 2 wave points are provided.
-        """
-        if len(wave_points) < 2:
-            raise ValueError("At least 2 wave points are required for an Elliott Wave drawing.")
-
-        drawing = Drawing(DrawingType.ELLIOTT_WAVE, color=color)
-        drawing.properties = {
-            "wave_points": wave_points,
-            "wave_type": wave_type,
-            "wave_count": len(wave_points),
-        }
-        self.drawings[drawing.drawing_id] = drawing
-        return drawing
-
-    # ------------------------------------------------------------------
-    # Text annotation
-    # ------------------------------------------------------------------
-
-    def draw_text(
-        self,
-        time: datetime,
-        price: float,
-        text: str,
-        color: str = "#FFFFFF",
-        font_size: int = 12,
-        background: Optional[str] = None,
-    ) -> Drawing:
-        """
-        Add a text annotation at a specific price/time coordinate.
-
-        Args:
-            time: Annotation timestamp.
-            price: Price level for the annotation.
-            text: Annotation text.
-            color: Text colour.
-            font_size: Font size in points.
-            background: Optional background colour.
+            config: ElliottWaveConfig with wave pivot points and labels.
 
         Returns:
             The created Drawing object.
         """
-        drawing = Drawing(DrawingType.TEXT, color=color)
+        drawing = Drawing(DrawingType.ELLIOTT_WAVE)
         drawing.properties = {
-            "time": time.isoformat() if isinstance(time, datetime) else time,
-            "price": price,
-            "text": text,
-            "font_size": font_size,
-            "background": background,
+            "points": config.points,
+            "wave_labels": config.wave_labels,
+            "is_impulse": config.is_impulse,
+            "style": config.style,
         }
-        self.drawings[drawing.drawing_id] = drawing
-        return drawing
+        first_time = config.points[0]["time"] if config.points else datetime.utcnow()
+        return self._store(f"EW_{self._ts(first_time)}", drawing)
 
     # ------------------------------------------------------------------
-    # Arrow annotation
+    # Circle / Arc
     # ------------------------------------------------------------------
 
-    def draw_arrow(
-        self,
-        time: datetime,
-        price: float,
-        direction: str = "up",
-        color: str = "#4CAF50",
-        size: int = 12,
-        label: Optional[str] = None,
-    ) -> Drawing:
+    def draw_circle(self, config: CircleConfig) -> Drawing:
         """
-        Draw an up/down arrow marker at a price/time coordinate.
+        Add a circle or arc annotation.
 
         Args:
-            time: Arrow timestamp.
-            price: Price level.
-            direction: 'up' or 'down'.
-            color: Arrow colour.
-            size: Arrow size in pixels.
-            label: Optional text label next to the arrow.
+            config: CircleConfig with centre coordinates and radius.
 
         Returns:
             The created Drawing object.
-
-        Raises:
-            ValueError: If direction is not 'up' or 'down'.
         """
-        if direction not in ("up", "down"):
-            raise ValueError(f"Arrow direction must be 'up' or 'down', got {direction!r}.")
-
-        drawing = Drawing(DrawingType.ARROW, color=color)
+        drawing = Drawing(DrawingType.CIRCLE)
         drawing.properties = {
-            "time": time.isoformat() if isinstance(time, datetime) else time,
-            "price": price,
-            "direction": direction,
-            "size": size,
-            "label": label or "",
+            "center_time": config.center_time,
+            "center_price": config.center_price,
+            "radius_bars": config.radius_bars,
+            "radius_price": config.radius_price,
+            "style": config.style,
+            "label": config.label,
         }
-        self.drawings[drawing.drawing_id] = drawing
-        return drawing
+        return self._store(f"CIR_{self._ts(config.center_time)}", drawing)
 
     # ------------------------------------------------------------------
-    # Management helpers
+    # Arrow
     # ------------------------------------------------------------------
 
-    def get_drawings(self, drawing_type: Optional[str] = None) -> List[Drawing]:
+    def draw_arrow(self, config: ArrowConfig) -> Drawing:
         """
-        Return all (or filtered) drawings.
+        Add an arrow annotation.
 
         Args:
-            drawing_type: If provided, only return drawings of this type.
+            config: ArrowConfig with start/end coordinates.
 
         Returns:
-            List of Drawing objects.
+            The created Drawing object.
         """
-        drawings = list(self.drawings.values())
-        if drawing_type:
-            drawings = [d for d in drawings if d.drawing_type == drawing_type]
-        return drawings
+        drawing = Drawing(DrawingType.ARROW)
+        drawing.properties = {
+            "start_time": config.start_time,
+            "start_price": config.start_price,
+            "end_time": config.end_time,
+            "end_price": config.end_price,
+            "style": config.style,
+            "label": config.label,
+        }
+        return self._store(f"ARR_{self._ts(config.start_time)}", drawing)
 
-    def get_drawing(self, drawing_id: str) -> Optional[Drawing]:
-        """Return a specific drawing by ID, or None if not found."""
-        return self.drawings.get(drawing_id)
+    # ------------------------------------------------------------------
+    # Fibonacci fan
+    # ------------------------------------------------------------------
+
+    def draw_fibonacci_fan(self, config: FibonacciConfig) -> Drawing:
+        """
+        Add a Fibonacci fan drawing.
+
+        Args:
+            config: FibonacciConfig with anchor points and fan levels.
+
+        Returns:
+            The created Drawing object.
+        """
+        drawing = Drawing(DrawingType.FIBONACCI_FAN)
+        drawing.properties = {
+            "start_time": config.start_time,
+            "start_price": config.start_price,
+            "end_time": config.end_time,
+            "end_price": config.end_price,
+            "levels": config.levels,
+            "style": config.style,
+        }
+        return self._store(f"FIBF_{self._ts(config.start_time)}", drawing)
+
+    # ------------------------------------------------------------------
+    # Query helpers
+    # ------------------------------------------------------------------
+
+    def get_drawings(self) -> List[Drawing]:
+        """Return all stored drawings."""
+        return list(self.drawings.values())
+
+    def get_drawings_by_type(self, drawing_type: str) -> List[Drawing]:
+        """
+        Return drawings of a specific type.
+
+        Args:
+            drawing_type: One of the DrawingType constants.
+
+        Returns:
+            Filtered list of Drawing objects.
+        """
+        return [d for d in self.drawings.values() if d.drawing_type == drawing_type]
 
     def remove_drawing(self, drawing_id: str) -> bool:
         """
-        Remove a drawing.
+        Remove a drawing by ID.
 
         Args:
-            drawing_id: Drawing to remove.
+            drawing_id: The key used when the drawing was stored.
 
         Returns:
-            True if removed, False if not found.
+            True if the drawing was found and removed, False otherwise.
         """
         if drawing_id in self.drawings:
             del self.drawings[drawing_id]
             return True
         return False
 
-    def clear_drawings(self, drawing_type: Optional[str] = None) -> int:
-        """
-        Remove all (or filtered) drawings.
+    def clear(self) -> None:
+        """Remove all drawings."""
+        self.drawings.clear()
 
-        Args:
-            drawing_type: If provided, only remove drawings of this type.
-
-        Returns:
-            Number of drawings removed.
-        """
-        if drawing_type is None:
-            count = len(self.drawings)
-            self.drawings.clear()
-            return count
-
-        keys_to_remove = [k for k, d in self.drawings.items() if d.drawing_type == drawing_type]
-        for k in keys_to_remove:
-            del self.drawings[k]
-        return len(keys_to_remove)
-
-    def show_drawing(self, drawing_id: str) -> bool:
-        """Make a drawing visible. Returns True on success."""
-        d = self.drawings.get(drawing_id)
-        if d:
-            d.visible = True
-            return True
-        return False
-
-    def hide_drawing(self, drawing_id: str) -> bool:
-        """Hide a drawing (keeps it stored but not rendered). Returns True on success."""
-        d = self.drawings.get(drawing_id)
-        if d:
-            d.visible = False
-            return True
-        return False
-
-    def update_drawing(self, drawing_id: str, **properties) -> bool:
-        """
-        Update properties of an existing drawing.
-
-        Args:
-            drawing_id: Drawing to update.
-            **properties: Key/value pairs to merge into drawing.properties.
-
-        Returns:
-            True on success, False if drawing not found.
-        """
-        d = self.drawings.get(drawing_id)
-        if not d:
-            return False
-        for key, value in properties.items():
-            if key in ("color", "line_width", "visible"):
-                setattr(d, key, value)
-            else:
-                d.properties[key] = value
-        return True
-
-    def export_drawings(self) -> List[Dict[str, Any]]:
-        """Serialise all drawings to a list of dicts (for persistence)."""
-        return [d.to_dict() for d in self.drawings.values()]
-
-    def import_drawings(self, data: List[Dict[str, Any]]) -> int:
-        """
-        Load drawings from a list of dicts (inverse of export_drawings).
-
-        Returns:
-            Number of drawings imported.
-        """
-        count = 0
-        for item in data:
-            try:
-                drawing = Drawing.from_dict(item)
-                self.drawings[drawing.drawing_id] = drawing
-                count += 1
-            except (KeyError, TypeError) as exc:
-                logger.warning("Skipping invalid drawing data: %s", exc)
-        return count
-
-    def get_drawings_count(self) -> int:
-        """Return the total number of stored drawings."""
-        return len(self.drawings)
+    def to_dict(self) -> Dict:
+        """Serialise all drawings to a dictionary."""
+        return {k: v.to_dict() for k, v in self.drawings.items()}

@@ -130,17 +130,23 @@ SYMBOL = 'XAUUSD'
 TIMEFRAME = '1H'
 LOOKBACK_DAYS = 365
 
-# Sample data structure
+# NOTE: Replace the sample_data block below with a real data fetch, e.g.:
+#   from cache.market_data_cache import MarketDataCache
+#   cache = MarketDataCache()
+#   df = cache.get_ohlcv(SYMBOL, TIMEFRAME, limit=100)
+# The placeholder uses a reproducible seed so notebook output is deterministic
+# during template preview — it must NOT be used for live trading.
+_rng = np.random.default_rng(seed=42)  # fixed seed — deterministic preview only
 sample_data = {
     'timestamp': pd.date_range(start='2023-01-01', periods=100, freq='h'),
-    'open': np.random.uniform(1940, 1960, 100),
-    'high': np.random.uniform(1950, 1970, 100),
-    'low': np.random.uniform(1930, 1950, 100),
-    'close': np.random.uniform(1940, 1960, 100),
-    'volume': np.random.randint(1000, 10000, 100)
+    'open':   _rng.uniform(1940, 1960, 100),
+    'high':   _rng.uniform(1950, 1970, 100),
+    'low':    _rng.uniform(1930, 1950, 100),
+    'close':  _rng.uniform(1940, 1960, 100),
+    'volume': _rng.integers(1000, 10000, 100).astype(float),
 }
 df = pd.DataFrame(sample_data)
-print(f"Loaded {len(df)} bars of data")
+print(f"Template preview: {len(df)} synthetic bars (replace with real data fetch)")
 df.head()
 """)
         
@@ -532,6 +538,104 @@ print("Feature engineering functions ready")
         return results
 
 
+def create_research_router(engine: 'ResearchNotebookEngine'):
+    """
+    Create a FastAPI router for the Research Notebooks module.
+
+    Args:
+        engine: ResearchNotebookEngine instance
+
+    Returns:
+        FastAPI APIRouter
+    """
+    from fastapi import APIRouter, HTTPException
+    from pydantic import BaseModel
+    from typing import Optional, List
+
+    router = APIRouter(prefix="/api/research", tags=["Research"])
+
+    class CreateNotebookRequest(BaseModel):
+        title: str
+        description: str
+        author: str = "user"
+        tags: List[str] = []
+
+    class AddCellRequest(BaseModel):
+        cell_type: str = "code"
+        content: str = ""
+
+    @router.get("/notebooks")
+    async def list_notebooks(query: Optional[str] = None, author: Optional[str] = None):
+        """List all research notebooks (excluding templates)."""
+        return engine.search_notebooks(query=query, author=author)
+
+    @router.post("/notebooks")
+    async def create_notebook(req: CreateNotebookRequest):
+        """Create a new research notebook."""
+        nb = engine.create_notebook(
+            title=req.title,
+            description=req.description,
+            author=req.author,
+            tags=req.tags,
+        )
+        return {
+            "notebook_id": nb.notebook_id,
+            "title": nb.title,
+            "description": nb.description,
+            "author": nb.author,
+            "created_at": nb.created_at.isoformat(),
+        }
+
+    @router.post("/notebooks/{notebook_id}/cells")
+    async def add_cell(notebook_id: str, req: AddCellRequest):
+        """Add a cell to a notebook."""
+        try:
+            cell_type = CellType(req.cell_type)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid cell_type '{req.cell_type}'")
+        cell = engine.add_cell(notebook_id, cell_type, req.content)
+        if not cell:
+            raise HTTPException(status_code=404, detail=f"Notebook {notebook_id} not found")
+        return {"cell_id": cell.cell_id, "status": cell.status.value}
+
+    @router.post("/notebooks/{notebook_id}/cells/{cell_id}/execute")
+    async def execute_cell(notebook_id: str, cell_id: str):
+        """Execute a single notebook cell."""
+        result = engine.execute_cell(notebook_id, cell_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Notebook or cell not found")
+        return result
+
+    @router.post("/notebooks/{notebook_id}/execute")
+    async def execute_all(notebook_id: str):
+        """Execute all cells in a notebook."""
+        results = engine.execute_all(notebook_id)
+        return {"notebook_id": notebook_id, "results": results}
+
+    @router.get("/notebooks/{notebook_id}/export")
+    async def export_notebook(notebook_id: str, format: str = "json"):
+        """Export a notebook as JSON or Python script."""
+        exported = engine.export_notebook(notebook_id, format)
+        if exported is None:
+            raise HTTPException(status_code=404, detail=f"Notebook {notebook_id} not found")
+        return {"notebook_id": notebook_id, "format": format, "content": exported}
+
+    @router.get("/templates")
+    async def list_templates():
+        """List available notebook templates."""
+        return engine.get_templates()
+
+    @router.post("/notebooks/from-template/{template_id}")
+    async def create_from_template(template_id: str, req: CreateNotebookRequest):
+        """Create a notebook from a template."""
+        nb = engine.create_from_template(template_id, req.title, req.author)
+        if nb is None:
+            raise HTTPException(status_code=404, detail=f"Template {template_id} not found")
+        return {"notebook_id": nb.notebook_id, "title": nb.title}
+
+    return router
+
+
 # Module exports
 __all__ = [
     'ResearchNotebookEngine',
@@ -539,4 +643,5 @@ __all__ = [
     'NotebookCell',
     'CellType',
     'CellStatus',
+    'create_research_router',
 ]

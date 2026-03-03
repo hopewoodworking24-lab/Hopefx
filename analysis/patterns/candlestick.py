@@ -1,942 +1,647 @@
 """
-Candlestick Pattern Detection Module
+Candlestick Pattern Detection
 
-Detects classic Japanese candlestick patterns from OHLCV price data:
-
-Single-candle:  Doji, Hammer, Hanging Man, Shooting Star, Inverted Hammer,
-                Marubozu, Spinning Top
-Two-candle:     Bullish/Bearish Engulfing, Bullish/Bearish Harami,
-                Piercing Line, Dark Cloud Cover
-Three-candle:   Morning Star, Evening Star, Three White Soldiers,
-                Three Black Crows
-
-Usage:
-    detector = CandlestickPatternDetector(config={'doji_threshold': 0.05})
-    patterns = detector.detect_patterns(prices_df, min_confidence=0.5)
-    for pattern in patterns:
-        print(pattern.to_dict())
+Identifies common single, dual, and multi-candlestick reversal and
+continuation patterns in OHLCV price data.
 """
 
-from __future__ import annotations
-
 import logging
-import threading
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
-import numpy as np
-import pandas as pd
+try:
+    import pandas as pd  # type: ignore[import]
+    HAS_PANDAS = True
+except ImportError:
+    pd = None  # type: ignore[assignment]
+    HAS_PANDAS = False
 
 logger = logging.getLogger(__name__)
-
-# ================================================================
-# DATACLASS
-# ================================================================
-
-_REQUIRED_COLUMNS = {"open", "high", "low", "close", "volume"}
 
 
 @dataclass
 class CandlestickPattern:
-    """
-    Detected candlestick pattern with metadata.
+    """Detected candlestick pattern."""
 
-    Attributes:
-        pattern_name: Human-readable name (e.g., ``'Hammer'``, ``'Doji'``).
-        pattern_type: Broad category of the pattern.
-            One of ``'reversal'``, ``'continuation'``, or ``'indecision'``.
-        direction: Expected price direction implied by the pattern.
-            One of ``'bullish'``, ``'bearish'``, or ``'neutral'``.
-        confidence: Detection confidence score in the range [0, 1].
-        index: Positional integer index in the price DataFrame at which
-            the **last** candle of the pattern occurs.
-        candles_count: Number of candles that form the pattern (1, 2 or 3).
-        description: Human-readable summary of the detected pattern.
-        timestamp: UTC datetime of the last candle in the pattern.
-    """
+    name: str
+    pattern_type: str          # 'bullish', 'bearish', 'neutral'
+    start_index: int
+    end_index: int
+    confidence: float          # 0.0 – 1.0
+    description: str = ""
 
-    pattern_name: str
-    pattern_type: str
-    direction: str
-    confidence: float
-    index: int
-    candles_count: int
-    description: str
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-
-    def to_dict(self) -> Dict[str, Any]:
-        """
-        Serialize the pattern to a plain dictionary.
-
-        Returns:
-            Dict with all pattern fields, suitable for JSON serialisation.
-        """
+    def to_dict(self) -> Dict:
         return {
-            "pattern_name": self.pattern_name,
+            "name": self.name,
             "pattern_type": self.pattern_type,
-            "direction": self.direction,
-            "confidence": round(self.confidence, 4),
-            "index": self.index,
-            "candles_count": self.candles_count,
+            "start_index": self.start_index,
+            "end_index": self.end_index,
+            "confidence": self.confidence,
             "description": self.description,
-            "timestamp": self.timestamp.isoformat(),
         }
 
 
-# ================================================================
-# DETECTOR
-# ================================================================
+# ---------------------------------------------------------------------------
+# Candle helpers
+# ---------------------------------------------------------------------------
+
+def _candle_body(open_: float, close: float) -> float:
+    """Absolute body size."""
+    return abs(close - open_)
+
+
+def _candle_range(high: float, low: float) -> float:
+    """Total candle range."""
+    return high - low
+
+
+def _upper_shadow(open_: float, high: float, close: float) -> float:
+    """Upper shadow length."""
+    return high - max(open_, close)
+
+
+def _lower_shadow(open_: float, low: float, close: float) -> float:
+    """Lower shadow length."""
+    return min(open_, close) - low
+
+
+def _is_bullish(open_: float, close: float) -> bool:
+    return close > open_
+
+
+def _is_bearish(open_: float, close: float) -> bool:
+    return close < open_
+
+
+def _body_ratio(open_: float, close: float, high: float, low: float) -> float:
+    """Body as a fraction of total range (0 if range is zero)."""
+    total = _candle_range(high, low)
+    if total == 0:
+        return 0.0
+    return _candle_body(open_, close) / total
+
+
+# ---------------------------------------------------------------------------
+# Doji helpers
+# ---------------------------------------------------------------------------
+
+def _is_doji(open_: float, close: float, high: float, low: float,
+             threshold: float = 0.05) -> bool:
+    """Body is less than *threshold* of the total range."""
+    return _body_ratio(open_, close, high, low) < threshold
+
+
+# ---------------------------------------------------------------------------
+# Single-candle patterns
+# ---------------------------------------------------------------------------
+
+def _detect_hammer(
+    opens: List[float],
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+    i: int,
+) -> Optional[CandlestickPattern]:
+    """Hammer / Hanging Man detection at index *i*."""
+    body = _candle_body(opens[i], closes[i])
+    total = _candle_range(highs[i], lows[i])
+    if total == 0:
+        return None
+
+    lower = _lower_shadow(opens[i], lows[i], closes[i])
+    upper = _upper_shadow(opens[i], highs[i], closes[i])
+
+    long_lower = lower >= 2 * body
+    small_upper = upper <= body * 0.3
+    decent_body = 0.1 < body / total < 0.5
+
+    if not (long_lower and small_upper and decent_body):
+        return None
+
+    pattern_type = "bullish" if _is_bullish(opens[i], closes[i]) else "neutral"
+    return CandlestickPattern(
+        name="Hammer",
+        pattern_type=pattern_type,
+        start_index=i,
+        end_index=i,
+        confidence=0.65,
+        description="Long lower shadow with small body near top of range",
+    )
+
+
+def _detect_shooting_star(
+    opens: List[float],
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+    i: int,
+) -> Optional[CandlestickPattern]:
+    """Shooting Star detection at index *i*."""
+    body = _candle_body(opens[i], closes[i])
+    total = _candle_range(highs[i], lows[i])
+    if total == 0:
+        return None
+
+    upper = _upper_shadow(opens[i], highs[i], closes[i])
+    lower = _lower_shadow(opens[i], lows[i], closes[i])
+
+    long_upper = upper >= 2 * body
+    small_lower = lower <= body * 0.3
+    decent_body = 0.1 < body / total < 0.5
+
+    if not (long_upper and small_lower and decent_body):
+        return None
+
+    return CandlestickPattern(
+        name="Shooting Star",
+        pattern_type="bearish",
+        start_index=i,
+        end_index=i,
+        confidence=0.65,
+        description="Long upper shadow with small body near bottom of range",
+    )
+
+
+def _detect_marubozu(
+    opens: List[float],
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+    i: int,
+) -> Optional[CandlestickPattern]:
+    """Marubozu (almost no shadows) detection at index *i*."""
+    body = _candle_body(opens[i], closes[i])
+    total = _candle_range(highs[i], lows[i])
+    if total == 0:
+        return None
+
+    ratio = body / total
+    if ratio < 0.9:
+        return None
+
+    if _is_bullish(opens[i], closes[i]):
+        return CandlestickPattern(
+            name="Bullish Marubozu",
+            pattern_type="bullish",
+            start_index=i,
+            end_index=i,
+            confidence=0.75,
+            description="Full-range bullish candle with minimal shadows",
+        )
+    return CandlestickPattern(
+        name="Bearish Marubozu",
+        pattern_type="bearish",
+        start_index=i,
+        end_index=i,
+        confidence=0.75,
+        description="Full-range bearish candle with minimal shadows",
+    )
+
+
+def _detect_doji_pattern(
+    opens: List[float],
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+    i: int,
+) -> Optional[CandlestickPattern]:
+    """Doji detection at index *i*."""
+    if not _is_doji(opens[i], closes[i], highs[i], lows[i]):
+        return None
+
+    upper = _upper_shadow(opens[i], highs[i], closes[i])
+    lower = _lower_shadow(opens[i], lows[i], closes[i])
+    total = _candle_range(highs[i], lows[i])
+
+    if total == 0:
+        return None
+
+    upper_ratio = upper / total
+    lower_ratio = lower / total
+
+    # Dragonfly Doji: almost all range in lower shadow
+    if lower_ratio > 0.8 and upper_ratio < 0.1:
+        return CandlestickPattern(
+            name="Dragonfly Doji",
+            pattern_type="bullish",
+            start_index=i,
+            end_index=i,
+            confidence=0.70,
+            description="Doji with very long lower shadow (bullish reversal signal)",
+        )
+
+    # Gravestone Doji: almost all range in upper shadow
+    if upper_ratio > 0.8 and lower_ratio < 0.1:
+        return CandlestickPattern(
+            name="Gravestone Doji",
+            pattern_type="bearish",
+            start_index=i,
+            end_index=i,
+            confidence=0.70,
+            description="Doji with very long upper shadow (bearish reversal signal)",
+        )
+
+    return CandlestickPattern(
+        name="Doji",
+        pattern_type="neutral",
+        start_index=i,
+        end_index=i,
+        confidence=0.55,
+        description="Very small body indicating indecision",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Two-candle patterns
+# ---------------------------------------------------------------------------
+
+def _detect_engulfing(
+    opens: List[float],
+    closes: List[float],
+    i: int,
+) -> Optional[CandlestickPattern]:
+    """Bullish / Bearish Engulfing detection ending at index *i*."""
+    if i < 1:
+        return None
+
+    prev_body = _candle_body(opens[i - 1], closes[i - 1])
+    curr_body = _candle_body(opens[i], closes[i])
+
+    if prev_body == 0 or curr_body <= prev_body:
+        return None
+
+    prev_bearish = _is_bearish(opens[i - 1], closes[i - 1])
+    curr_bullish = _is_bullish(opens[i], closes[i])
+    curr_open_below = opens[i] < closes[i - 1]
+    curr_close_above = closes[i] > opens[i - 1]
+
+    is_bullish_engulfing = (
+        prev_bearish and curr_bullish
+        and curr_open_below and curr_close_above
+    )
+    if is_bullish_engulfing:
+        return CandlestickPattern(
+            name="Bullish Engulfing",
+            pattern_type="bullish",
+            start_index=i - 1,
+            end_index=i,
+            confidence=0.75,
+            description="Current bullish candle fully engulfs the previous bearish candle",
+        )
+
+    prev_bullish = _is_bullish(opens[i - 1], closes[i - 1])
+    curr_bearish = _is_bearish(opens[i], closes[i])
+    curr_open_above = opens[i] > closes[i - 1]
+    curr_close_below = closes[i] < opens[i - 1]
+
+    is_bearish_engulfing = (
+        prev_bullish and curr_bearish
+        and curr_open_above and curr_close_below
+    )
+    if is_bearish_engulfing:
+        return CandlestickPattern(
+            name="Bearish Engulfing",
+            pattern_type="bearish",
+            start_index=i - 1,
+            end_index=i,
+            confidence=0.75,
+            description="Current bearish candle fully engulfs the previous bullish candle",
+        )
+
+    return None
+
+
+def _detect_harami(
+    opens: List[float],
+    closes: List[float],
+    i: int,
+) -> Optional[CandlestickPattern]:
+    """Bullish / Bearish Harami detection ending at index *i*."""
+    if i < 1:
+        return None
+
+    prev_body = _candle_body(opens[i - 1], closes[i - 1])
+    curr_body = _candle_body(opens[i], closes[i])
+
+    if prev_body == 0 or curr_body >= prev_body:
+        return None
+
+    prev_high_body = max(opens[i - 1], closes[i - 1])
+    prev_low_body = min(opens[i - 1], closes[i - 1])
+    curr_inside = (
+        prev_low_body <= opens[i] <= prev_high_body
+        and prev_low_body <= closes[i] <= prev_high_body
+    )
+
+    if not curr_inside:
+        return None
+
+    prev_bearish = _is_bearish(opens[i - 1], closes[i - 1])
+    if prev_bearish:
+        return CandlestickPattern(
+            name="Bullish Harami",
+            pattern_type="bullish",
+            start_index=i - 1,
+            end_index=i,
+            confidence=0.60,
+            description="Small bullish candle contained within previous bearish candle",
+        )
+
+    return CandlestickPattern(
+        name="Bearish Harami",
+        pattern_type="bearish",
+        start_index=i - 1,
+        end_index=i,
+        confidence=0.60,
+        description="Small bearish candle contained within previous bullish candle",
+    )
+
+
+def _detect_piercing_dark_cloud(
+    opens: List[float],
+    closes: List[float],
+    i: int,
+) -> Optional[CandlestickPattern]:
+    """Piercing Line / Dark Cloud Cover ending at index *i*."""
+    if i < 1:
+        return None
+
+    prev_bearish = _is_bearish(opens[i - 1], closes[i - 1])
+    curr_bullish = _is_bullish(opens[i], closes[i])
+
+    if prev_bearish and curr_bullish:
+        prev_mid = (opens[i - 1] + closes[i - 1]) / 2
+        opens_below = opens[i] < closes[i - 1]
+        closes_above_mid = closes[i] > prev_mid
+        closes_below_prev_open = closes[i] < opens[i - 1]
+
+        if opens_below and closes_above_mid and closes_below_prev_open:
+            return CandlestickPattern(
+                name="Piercing Line",
+                pattern_type="bullish",
+                start_index=i - 1,
+                end_index=i,
+                confidence=0.65,
+                description="Bullish candle closes above midpoint of previous bearish candle",
+            )
+
+    prev_bullish = _is_bullish(opens[i - 1], closes[i - 1])
+    curr_bearish = _is_bearish(opens[i], closes[i])
+
+    if prev_bullish and curr_bearish:
+        prev_mid = (opens[i - 1] + closes[i - 1]) / 2
+        opens_above = opens[i] > closes[i - 1]
+        closes_below_mid = closes[i] < prev_mid
+        closes_above_prev_open = closes[i] > opens[i - 1]
+
+        if opens_above and closes_below_mid and closes_above_prev_open:
+            return CandlestickPattern(
+                name="Dark Cloud Cover",
+                pattern_type="bearish",
+                start_index=i - 1,
+                end_index=i,
+                confidence=0.65,
+                description="Bearish candle closes below midpoint of previous bullish candle",
+            )
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Three-candle patterns
+# ---------------------------------------------------------------------------
+
+def _three_candle_trend(
+    opens: List[float],
+    closes: List[float],
+    i: int,
+) -> tuple:
+    """Return (all_bullish, all_bearish, rising_closes, falling_closes)."""
+    all_bullish = all(
+        _is_bullish(opens[j], closes[j]) for j in range(i - 2, i + 1)
+    )
+    all_bearish = all(
+        _is_bearish(opens[j], closes[j]) for j in range(i - 2, i + 1)
+    )
+    rising_closes = closes[i - 1] > closes[i - 2] and closes[i] > closes[i - 1]
+    falling_closes = closes[i - 1] < closes[i - 2] and closes[i] < closes[i - 1]
+    return all_bullish, all_bearish, rising_closes, falling_closes
+
+
+def _detect_three_soldiers_crows(
+    opens: List[float],
+    closes: List[float],
+    i: int,
+) -> Optional[CandlestickPattern]:
+    """Three White Soldiers / Three Black Crows ending at index *i*."""
+    if i < 2:
+        return None
+
+    all_bullish, all_bearish, rising, falling = _three_candle_trend(
+        opens, closes, i
+    )
+
+    if all_bullish and rising:
+        return CandlestickPattern(
+            name="Three White Soldiers",
+            pattern_type="bullish",
+            start_index=i - 2,
+            end_index=i,
+            confidence=0.80,
+            description="Three consecutive bullish candles with rising closes",
+        )
+
+    if all_bearish and falling:
+        return CandlestickPattern(
+            name="Three Black Crows",
+            pattern_type="bearish",
+            start_index=i - 2,
+            end_index=i,
+            confidence=0.80,
+            description="Three consecutive bearish candles with falling closes",
+        )
+
+    return None
+
+
+def _detect_morning_evening_star(
+    opens: List[float],
+    closes: List[float],
+    i: int,
+) -> Optional[CandlestickPattern]:
+    """Morning Star / Evening Star ending at index *i*."""
+    if i < 2:
+        return None
+
+    first_body = _candle_body(opens[i - 2], closes[i - 2])
+    mid_body = _candle_body(opens[i - 1], closes[i - 1])
+    last_body = _candle_body(opens[i], closes[i])
+
+    if first_body == 0 or last_body == 0:
+        return None
+
+    mid_is_small = mid_body < first_body * 0.4
+    last_is_large = last_body >= first_body * 0.5
+
+    if not (mid_is_small and last_is_large):
+        return None
+
+    first_bearish = _is_bearish(opens[i - 2], closes[i - 2])
+    last_bullish = _is_bullish(opens[i], closes[i])
+    last_close_deep = closes[i] > (opens[i - 2] + closes[i - 2]) / 2
+
+    if first_bearish and last_bullish and last_close_deep:
+        return CandlestickPattern(
+            name="Morning Star",
+            pattern_type="bullish",
+            start_index=i - 2,
+            end_index=i,
+            confidence=0.80,
+            description="Bearish candle, indecision candle, then strong bullish candle",
+        )
+
+    first_bullish = _is_bullish(opens[i - 2], closes[i - 2])
+    last_bearish = _is_bearish(opens[i], closes[i])
+    last_close_high = closes[i] < (opens[i - 2] + closes[i - 2]) / 2
+
+    if first_bullish and last_bearish and last_close_high:
+        return CandlestickPattern(
+            name="Evening Star",
+            pattern_type="bearish",
+            start_index=i - 2,
+            end_index=i,
+            confidence=0.80,
+            description="Bullish candle, indecision candle, then strong bearish candle",
+        )
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Pattern detector
+# ---------------------------------------------------------------------------
+
+_SINGLE_DETECTORS = [
+    _detect_doji_pattern,
+    _detect_hammer,
+    _detect_shooting_star,
+    _detect_marubozu,
+]
+
+_TWO_CANDLE_DETECTORS = [
+    _detect_engulfing,
+    _detect_harami,
+    _detect_piercing_dark_cloud,
+]
+
+_THREE_CANDLE_DETECTORS = [
+    _detect_three_soldiers_crows,
+    _detect_morning_evening_star,
+]
 
 
 class CandlestickPatternDetector:
     """
-    Detects Japanese candlestick patterns from OHLCV price data.
+    Detects candlestick patterns in OHLCV price data.
 
-    Supported single-candle patterns:
-        Doji, Hammer, Hanging Man, Shooting Star, Inverted Hammer,
-        Marubozu, Spinning Top
+    Supports both list-based and pandas-DataFrame input.
 
-    Supported two-candle patterns:
-        Bullish Engulfing, Bearish Engulfing, Bullish Harami,
-        Bearish Harami, Piercing Line, Dark Cloud Cover
+    Usage::
 
-    Supported three-candle patterns:
-        Morning Star, Evening Star, Three White Soldiers,
-        Three Black Crows
-
-    The prices DataFrame must have lowercase columns:
-    ``open``, ``high``, ``low``, ``close``, ``volume`` and a datetime index.
-
-    Usage:
-        detector = CandlestickPatternDetector(config={'doji_threshold': 0.05})
-        patterns = detector.detect_patterns(prices, min_confidence=0.5)
+        detector = CandlestickPatternDetector()
+        patterns = detector.detect(opens, highs, lows, closes)
         for p in patterns:
-            print(p.to_dict())
+            print(p.name, p.pattern_type, p.confidence)
     """
 
-    def __init__(self, config: Optional[Dict] = None):
-        """
-        Initialize the candlestick pattern detector.
-
-        Args:
-            config: Optional configuration dict. Supported keys:
-
-                - ``doji_threshold`` (float): Maximum ratio of body size to
-                  total candle range for a candle to qualify as a Doji.
-                  Default ``0.05`` (5 %).
-                - ``wick_ratio`` (float): Minimum ratio of wick length to
-                  body size required for Hammer / Shooting Star patterns.
-                  Default ``2.0``.
-                - ``marubozu_threshold`` (float): Maximum ratio of total wick
-                  length to body size for a Marubozu candle. Default ``0.05``.
-                - ``spinning_top_body_ratio`` (float): Maximum ratio of body
-                  to total range to qualify as a Spinning Top. Default ``0.3``.
-                - ``engulfing_min_body_ratio`` (float): Minimum ratio by which
-                  the engulfing body must exceed the prior body. Default ``1.0``.
-                - ``star_gap_pct`` (float): Minimum fractional gap (of close
-                  price) between the star body and the prior candle body for
-                  Morning / Evening Star. Default ``0.0`` (gaps not required;
-                  many data feeds include after-hours gaps already).
-                - ``soldiers_crows_min_body_ratio`` (float): Minimum ratio of
-                  body to range for each candle in Three White Soldiers / Three
-                  Black Crows. Default ``0.6``.
-                - ``max_patterns_per_type`` (int): Maximum patterns returned
-                  per detection method. Default ``10``.
-        """
-        self.config: Dict = config or {}
-
-        self.doji_threshold: float = self.config.get("doji_threshold", 0.05)
-        self.wick_ratio: float = self.config.get("wick_ratio", 2.0)
-        self.marubozu_threshold: float = self.config.get("marubozu_threshold", 0.05)
-        self.spinning_top_body_ratio: float = self.config.get(
-            "spinning_top_body_ratio", 0.3
-        )
-        self.engulfing_min_body_ratio: float = self.config.get(
-            "engulfing_min_body_ratio", 1.0
-        )
-        self.star_gap_pct: float = self.config.get("star_gap_pct", 0.0)
-        self.soldiers_crows_min_body_ratio: float = self.config.get(
-            "soldiers_crows_min_body_ratio", 0.6
-        )
-        self.max_patterns_per_type: int = self.config.get("max_patterns_per_type", 10)
-
-        # Lock for thread-safe access to any mutable state
-        self._lock = threading.Lock()
-
-        logger.info("CandlestickPatternDetector initialized with config=%s", self.config)
-
-    # ================================================================
-    # PUBLIC API
-    # ================================================================
-
-    def detect_patterns(
+    def detect(
         self,
-        prices: pd.DataFrame,
-        min_confidence: float = 0.5,
+        opens: List[float],
+        highs: List[float],
+        lows: List[float],
+        closes: List[float],
     ) -> List[CandlestickPattern]:
         """
-        Detect all supported candlestick patterns in the given price data.
-
-        Runs every individual detection group and aggregates the results,
-        filtering by ``min_confidence`` and sorting by index ascending (then
-        confidence descending for ties).
+        Detect all candlestick patterns in the given OHLC lists.
 
         Args:
-            prices: DataFrame with columns ``open``, ``high``, ``low``,
-                ``close``, ``volume`` and a datetime index. Must contain at
-                least 3 rows.
-            min_confidence: Minimum confidence threshold (inclusive) for
-                returned patterns. Must be in [0, 1]. Default ``0.5``.
+            opens: List of open prices.
+            highs: List of high prices.
+            lows: List of low prices.
+            closes: List of close prices.
 
         Returns:
-            List of :class:`CandlestickPattern` objects sorted by index
-            ascending, confidence descending within the same index.
+            List of detected CandlestickPattern objects.
         """
-        if not self._validate_dataframe(prices):
-            return []
-
-        all_patterns: List[CandlestickPattern] = []
-
-        detectors = [
-            self.detect_single_candle_patterns,
-            self.detect_two_candle_patterns,
-            self.detect_three_candle_patterns,
-        ]
-
-        for detect_fn in detectors:
-            try:
-                all_patterns.extend(detect_fn(prices))
-            except Exception as exc:
-                logger.error(
-                    "Error in %s: %s", detect_fn.__name__, exc, exc_info=True
-                )
-
-        filtered = [p for p in all_patterns if p.confidence >= min_confidence]
-        filtered.sort(key=lambda p: (p.index, -p.confidence))
-
-        logger.debug(
-            "detect_patterns: found %d pattern(s) above confidence %.2f",
-            len(filtered),
-            min_confidence,
-        )
-        return filtered
-
-    def detect_single_candle_patterns(
-        self, prices: pd.DataFrame
-    ) -> List[CandlestickPattern]:
-        """
-        Detect single-candle patterns across the entire price DataFrame.
-
-        Detected patterns: Doji, Hammer, Hanging Man, Shooting Star,
-        Inverted Hammer, Marubozu, Spinning Top.
-
-        Args:
-            prices: OHLCV DataFrame with datetime index.
-
-        Returns:
-            List of detected :class:`CandlestickPattern` objects.
-        """
-        if not self._validate_dataframe(prices):
+        n = len(closes)
+        if n == 0:
             return []
 
         patterns: List[CandlestickPattern] = []
-        o = prices["open"].values
-        h = prices["high"].values
-        lows = prices["low"].values
-        c = prices["close"].values
-        timestamps = prices.index
 
-        for i in range(len(prices)):
-            ts = self._to_utc_datetime(timestamps[i])
-            candle_range = h[i] - lows[i]
-            if candle_range <= 0:
-                continue
+        for i in range(n):
+            for detector in _SINGLE_DETECTORS:
+                p = detector(opens, highs, lows, closes, i)
+                if p:
+                    patterns.append(p)
+                    break  # One pattern per candle for single-candle set
 
-            body = abs(c[i] - o[i])
-            body_mid = (o[i] + c[i]) / 2.0
-            upper_wick = h[i] - max(o[i], c[i])
-            lower_wick = min(o[i], c[i]) - lows[i]
-            is_bullish = c[i] >= o[i]
+            if i >= 1:
+                for detector in _TWO_CANDLE_DETECTORS:
+                    p = detector(opens, closes, i)
+                    if p:
+                        patterns.append(p)
+                        break
 
-            # Use simple moving window (20 bars) to decide trend context
-            trend = self._trend_context(c, i, window=20)
+            if i >= 2:
+                for detector in _THREE_CANDLE_DETECTORS:
+                    p = detector(opens, closes, i)
+                    if p:
+                        patterns.append(p)
+                        break
 
-            # ---- Doji ----
-            if body / candle_range <= self.doji_threshold:
-                confidence = round(1.0 - (body / candle_range) / self.doji_threshold, 4)
-                patterns.append(
-                    CandlestickPattern(
-                        pattern_name="Doji",
-                        pattern_type="indecision",
-                        direction="neutral",
-                        confidence=min(confidence, 1.0),
-                        index=i,
-                        candles_count=1,
-                        description=(
-                            "Open and close are nearly equal, signalling market"
-                            " indecision and a potential trend reversal."
-                        ),
-                        timestamp=ts,
-                    )
-                )
-                continue  # A pure Doji supersedes other single-candle labels
+        return patterns
 
-            # ---- Marubozu ----
-            total_wick = upper_wick + lower_wick
-            if body > 0 and total_wick / body <= self.marubozu_threshold:
-                confidence = round(
-                    1.0 - (total_wick / body) / max(self.marubozu_threshold, 1e-9), 4
-                )
-                patterns.append(
-                    CandlestickPattern(
-                        pattern_name="Marubozu",
-                        pattern_type="continuation",
-                        direction="bullish" if is_bullish else "bearish",
-                        confidence=min(confidence, 1.0),
-                        index=i,
-                        candles_count=1,
-                        description=(
-                            "Full-body candle with virtually no wicks, indicating"
-                            " strong momentum in the candle direction."
-                        ),
-                        timestamp=ts,
-                    )
-                )
-                continue
-
-            # ---- Spinning Top ----
-            if (
-                body / candle_range <= self.spinning_top_body_ratio
-                and upper_wick > 0
-                and lower_wick > 0
-                and abs(upper_wick - lower_wick) / candle_range < 0.15
-            ):
-                confidence = round(
-                    0.5
-                    + 0.5 * (1.0 - body / (candle_range * self.spinning_top_body_ratio)),
-                    4,
-                )
-                patterns.append(
-                    CandlestickPattern(
-                        pattern_name="Spinning Top",
-                        pattern_type="indecision",
-                        direction="neutral",
-                        confidence=min(confidence, 1.0),
-                        index=i,
-                        candles_count=1,
-                        description=(
-                            "Small body with approximately equal upper and lower wicks,"
-                            " indicating indecision between buyers and sellers."
-                        ),
-                        timestamp=ts,
-                    )
-                )
-                continue
-
-            # ---- Hammer / Hanging Man ----
-            # Long lower wick, small upper wick, body in upper portion
-            if (
-                body > 0
-                and lower_wick / body >= self.wick_ratio
-                and upper_wick / candle_range <= 0.1
-            ):
-                confidence = round(
-                    min(lower_wick / (body * self.wick_ratio), 1.0) * 0.85 + 0.1, 4
-                )
-                if trend == "downtrend":
-                    patterns.append(
-                        CandlestickPattern(
-                            pattern_name="Hammer",
-                            pattern_type="reversal",
-                            direction="bullish",
-                            confidence=confidence,
-                            index=i,
-                            candles_count=1,
-                            description=(
-                                "Long lower wick with small body near the high,"
-                                " appearing after a downtrend; bullish reversal signal."
-                            ),
-                            timestamp=ts,
-                        )
-                    )
-                else:
-                    patterns.append(
-                        CandlestickPattern(
-                            pattern_name="Hanging Man",
-                            pattern_type="reversal",
-                            direction="bearish",
-                            confidence=confidence * 0.9,
-                            index=i,
-                            candles_count=1,
-                            description=(
-                                "Long lower wick with small body near the high,"
-                                " appearing after an uptrend; bearish reversal signal."
-                            ),
-                            timestamp=ts,
-                        )
-                    )
-
-            # ---- Shooting Star / Inverted Hammer ----
-            # Long upper wick, small lower wick, body in lower portion
-            elif (
-                body > 0
-                and upper_wick / body >= self.wick_ratio
-                and lower_wick / candle_range <= 0.1
-            ):
-                confidence = round(
-                    min(upper_wick / (body * self.wick_ratio), 1.0) * 0.85 + 0.1, 4
-                )
-                if trend == "uptrend":
-                    patterns.append(
-                        CandlestickPattern(
-                            pattern_name="Shooting Star",
-                            pattern_type="reversal",
-                            direction="bearish",
-                            confidence=confidence,
-                            index=i,
-                            candles_count=1,
-                            description=(
-                                "Long upper wick with small body near the low,"
-                                " appearing after an uptrend; bearish reversal signal."
-                            ),
-                            timestamp=ts,
-                        )
-                    )
-                else:
-                    patterns.append(
-                        CandlestickPattern(
-                            pattern_name="Inverted Hammer",
-                            pattern_type="reversal",
-                            direction="bullish",
-                            confidence=confidence * 0.9,
-                            index=i,
-                            candles_count=1,
-                            description=(
-                                "Long upper wick with small body near the low,"
-                                " appearing after a downtrend; bullish reversal signal."
-                            ),
-                            timestamp=ts,
-                        )
-                    )
-
-        return patterns[: self.max_patterns_per_type]
-
-    def detect_two_candle_patterns(
-        self, prices: pd.DataFrame
-    ) -> List[CandlestickPattern]:
+    def detect_from_dataframe(self, df: "pd.DataFrame") -> List[CandlestickPattern]:
         """
-        Detect two-candle patterns across the entire price DataFrame.
+        Detect patterns from a pandas DataFrame.
 
-        Detected patterns: Bullish Engulfing, Bearish Engulfing,
-        Bullish Harami, Bearish Harami, Piercing Line, Dark Cloud Cover.
+        The DataFrame must have columns: open, high, low, close (case-insensitive).
 
         Args:
-            prices: OHLCV DataFrame with datetime index.
+            df: OHLC DataFrame.
 
         Returns:
-            List of detected :class:`CandlestickPattern` objects.
+            List of detected CandlestickPattern objects.
         """
-        if not self._validate_dataframe(prices) or len(prices) < 2:
-            return []
+        cols = {c.lower(): c for c in df.columns}
+        opens = df[cols["open"]].tolist()
+        highs = df[cols["high"]].tolist()
+        lows = df[cols["low"]].tolist()
+        closes = df[cols["close"]].tolist()
+        return self.detect(opens, highs, lows, closes)
 
-        patterns: List[CandlestickPattern] = []
-        o = prices["open"].values
-        h = prices["high"].values
-        lows = prices["low"].values
-        c = prices["close"].values
-        timestamps = prices.index
-
-        for i in range(1, len(prices)):
-            ts = self._to_utc_datetime(timestamps[i])
-            p_o, p_c = o[i - 1], c[i - 1]  # prior candle
-            c_o, c_c = o[i], c[i]           # current candle
-
-            p_body = abs(p_c - p_o)
-            c_body = abs(c_c - c_o)
-
-            p_is_bull = p_c >= p_o
-            c_is_bull = c_c >= c_o
-
-            p_body_high = max(p_o, p_c)
-            p_body_low = min(p_o, p_c)
-            c_body_high = max(c_o, c_c)
-            c_body_low = min(c_o, c_c)
-
-            trend = self._trend_context(c, i, window=20)
-
-            if p_body <= 0 or c_body <= 0:
-                continue
-
-            # ---- Bullish Engulfing ----
-            if (
-                not p_is_bull
-                and c_is_bull
-                and c_body >= p_body * self.engulfing_min_body_ratio
-                and c_o <= p_c
-                and c_c >= p_o
-            ):
-                ratio = min(c_body / p_body, 2.0)
-                confidence = round(0.5 + 0.4 * min(ratio / 1.5, 1.0), 4)
-                patterns.append(
-                    CandlestickPattern(
-                        pattern_name="Bullish Engulfing",
-                        pattern_type="reversal",
-                        direction="bullish",
-                        confidence=confidence,
-                        index=i,
-                        candles_count=2,
-                        description=(
-                            "A large bullish candle fully engulfs the prior bearish"
-                            " candle; strong bullish reversal signal."
-                        ),
-                        timestamp=ts,
-                    )
-                )
-
-            # ---- Bearish Engulfing ----
-            elif (
-                p_is_bull
-                and not c_is_bull
-                and c_body >= p_body * self.engulfing_min_body_ratio
-                and c_o >= p_c
-                and c_c <= p_o
-            ):
-                ratio = min(c_body / p_body, 2.0)
-                confidence = round(0.5 + 0.4 * min(ratio / 1.5, 1.0), 4)
-                patterns.append(
-                    CandlestickPattern(
-                        pattern_name="Bearish Engulfing",
-                        pattern_type="reversal",
-                        direction="bearish",
-                        confidence=confidence,
-                        index=i,
-                        candles_count=2,
-                        description=(
-                            "A large bearish candle fully engulfs the prior bullish"
-                            " candle; strong bearish reversal signal."
-                        ),
-                        timestamp=ts,
-                    )
-                )
-
-            # ---- Bullish Harami ----
-            elif (
-                not p_is_bull
-                and c_is_bull
-                and c_body_high <= p_body_high
-                and c_body_low >= p_body_low
-                and c_body < p_body
-            ):
-                containment = 1.0 - c_body / p_body
-                confidence = round(0.5 + 0.35 * containment, 4)
-                patterns.append(
-                    CandlestickPattern(
-                        pattern_name="Bullish Harami",
-                        pattern_type="reversal",
-                        direction="bullish",
-                        confidence=confidence,
-                        index=i,
-                        candles_count=2,
-                        description=(
-                            "A small bullish candle contained within the prior large"
-                            " bearish candle; potential bullish reversal."
-                        ),
-                        timestamp=ts,
-                    )
-                )
-
-            # ---- Bearish Harami ----
-            elif (
-                p_is_bull
-                and not c_is_bull
-                and c_body_high <= p_body_high
-                and c_body_low >= p_body_low
-                and c_body < p_body
-            ):
-                containment = 1.0 - c_body / p_body
-                confidence = round(0.5 + 0.35 * containment, 4)
-                patterns.append(
-                    CandlestickPattern(
-                        pattern_name="Bearish Harami",
-                        pattern_type="reversal",
-                        direction="bearish",
-                        confidence=confidence,
-                        index=i,
-                        candles_count=2,
-                        description=(
-                            "A small bearish candle contained within the prior large"
-                            " bullish candle; potential bearish reversal."
-                        ),
-                        timestamp=ts,
-                    )
-                )
-
-            # ---- Piercing Line ----
-            # Prior bearish candle, current bullish opens below prior low
-            # and closes above midpoint of prior body
-            elif (
-                not p_is_bull
-                and c_is_bull
-                and c_o < p_c
-                and c_c > p_o + p_body * 0.5
-                and c_c < p_o
-            ):
-                penetration = (c_c - p_c) / p_body
-                confidence = round(0.5 + 0.45 * min(penetration, 1.0), 4)
-                patterns.append(
-                    CandlestickPattern(
-                        pattern_name="Piercing Line",
-                        pattern_type="reversal",
-                        direction="bullish",
-                        confidence=confidence,
-                        index=i,
-                        candles_count=2,
-                        description=(
-                            "A bullish candle opens below the prior close and closes"
-                            " above the midpoint of the prior bearish body;"
-                            " bullish reversal signal."
-                        ),
-                        timestamp=ts,
-                    )
-                )
-
-            # ---- Dark Cloud Cover ----
-            # Prior bullish candle, current bearish opens above prior high
-            # and closes below midpoint of prior body
-            elif (
-                p_is_bull
-                and not c_is_bull
-                and c_o > p_c
-                and c_c < p_o + p_body * 0.5
-                and c_c > p_o
-            ):
-                penetration = (p_c - c_c) / p_body
-                confidence = round(0.5 + 0.45 * min(penetration, 1.0), 4)
-                patterns.append(
-                    CandlestickPattern(
-                        pattern_name="Dark Cloud Cover",
-                        pattern_type="reversal",
-                        direction="bearish",
-                        confidence=confidence,
-                        index=i,
-                        candles_count=2,
-                        description=(
-                            "A bearish candle opens above the prior close and closes"
-                            " below the midpoint of the prior bullish body;"
-                            " bearish reversal signal."
-                        ),
-                        timestamp=ts,
-                    )
-                )
-
-        return patterns[: self.max_patterns_per_type]
-
-    def detect_three_candle_patterns(
-        self, prices: pd.DataFrame
-    ) -> List[CandlestickPattern]:
-        """
-        Detect three-candle patterns across the entire price DataFrame.
-
-        Detected patterns: Morning Star, Evening Star,
-        Three White Soldiers, Three Black Crows.
-
-        Args:
-            prices: OHLCV DataFrame with datetime index.
-
-        Returns:
-            List of detected :class:`CandlestickPattern` objects.
-        """
-        if not self._validate_dataframe(prices) or len(prices) < 3:
-            return []
-
-        patterns: List[CandlestickPattern] = []
-        o = prices["open"].values
-        h = prices["high"].values
-        lows = prices["low"].values
-        c = prices["close"].values
-        timestamps = prices.index
-
-        for i in range(2, len(prices)):
-            ts = self._to_utc_datetime(timestamps[i])
-
-            # Candle indices: first=i-2, second=i-1, third=i
-            o1, c1 = o[i - 2], c[i - 2]
-            o2, c2 = o[i - 1], c[i - 1]
-            o3, c3 = o[i], c[i]
-
-            h1, l1 = h[i - 2], lows[i - 2]
-            h2, l2 = h[i - 1], lows[i - 1]
-            h3, l3 = h[i], lows[i]
-
-            body1 = abs(c1 - o1)
-            body2 = abs(c2 - o2)
-            body3 = abs(c3 - o3)
-
-            range1 = h1 - l1
-            range2 = h2 - l2
-            range3 = h3 - l3
-
-            is_bull1 = c1 >= o1
-            is_bull2 = c2 >= o2
-            is_bull3 = c3 >= o3
-
-            if range1 <= 0 or range3 <= 0:
-                continue
-
-            # ---- Morning Star ----
-            # Candle 1: large bearish; Candle 2: small body (star) gaps down;
-            # Candle 3: large bullish closing well into candle 1 body
-            if (
-                not is_bull1
-                and body1 / range1 >= 0.5
-                and body2 / max(range2, 1e-9) <= 0.35
-                and is_bull3
-                and body3 / range3 >= 0.5
-                and c3 > o1 + body1 * 0.5
-                and max(o2, c2) < min(o1, c1)
-            ):
-                penetration = (c3 - (o1 - body1 * 0.5)) / body1
-                confidence = round(0.55 + 0.40 * min(penetration, 1.0), 4)
-                patterns.append(
-                    CandlestickPattern(
-                        pattern_name="Morning Star",
-                        pattern_type="reversal",
-                        direction="bullish",
-                        confidence=min(confidence, 0.95),
-                        index=i,
-                        candles_count=3,
-                        description=(
-                            "Three-candle bullish reversal: large bearish candle,"
-                            " small star candle gapping down, followed by a large"
-                            " bullish candle closing into the first candle's body."
-                        ),
-                        timestamp=ts,
-                    )
-                )
-
-            # ---- Evening Star ----
-            # Candle 1: large bullish; Candle 2: small body (star) gaps up;
-            # Candle 3: large bearish closing well into candle 1 body
-            elif (
-                is_bull1
-                and body1 / range1 >= 0.5
-                and body2 / max(range2, 1e-9) <= 0.35
-                and not is_bull3
-                and body3 / range3 >= 0.5
-                and c3 < o1 + body1 * 0.5
-                and min(o2, c2) > max(o1, c1)
-            ):
-                penetration = ((o1 + body1 * 0.5) - c3) / body1
-                confidence = round(0.55 + 0.40 * min(penetration, 1.0), 4)
-                patterns.append(
-                    CandlestickPattern(
-                        pattern_name="Evening Star",
-                        pattern_type="reversal",
-                        direction="bearish",
-                        confidence=min(confidence, 0.95),
-                        index=i,
-                        candles_count=3,
-                        description=(
-                            "Three-candle bearish reversal: large bullish candle,"
-                            " small star candle gapping up, followed by a large"
-                            " bearish candle closing into the first candle's body."
-                        ),
-                        timestamp=ts,
-                    )
-                )
-
-            # ---- Three White Soldiers ----
-            # Three consecutive bullish candles, each closing higher with
-            # large bodies and opening within the prior body
-            elif (
-                is_bull1
-                and is_bull2
-                and is_bull3
-                and c3 > c2 > c1
-                and body1 / range1 >= self.soldiers_crows_min_body_ratio
-                and body2 / range2 >= self.soldiers_crows_min_body_ratio
-                and body3 / range3 >= self.soldiers_crows_min_body_ratio
-                and o2 >= o1
-                and o2 <= c1
-                and o3 >= o2
-                and o3 <= c2
-            ):
-                avg_body_ratio = (
-                    body1 / range1 + body2 / range2 + body3 / range3
-                ) / 3.0
-                confidence = round(
-                    0.6 + 0.35 * min(avg_body_ratio / self.soldiers_crows_min_body_ratio - 1.0, 1.0),
-                    4,
-                )
-                patterns.append(
-                    CandlestickPattern(
-                        pattern_name="Three White Soldiers",
-                        pattern_type="continuation",
-                        direction="bullish",
-                        confidence=min(confidence, 0.95),
-                        index=i,
-                        candles_count=3,
-                        description=(
-                            "Three consecutive large bullish candles each closing"
-                            " progressively higher; strong bullish continuation signal."
-                        ),
-                        timestamp=ts,
-                    )
-                )
-
-            # ---- Three Black Crows ----
-            # Three consecutive bearish candles, each closing lower with
-            # large bodies and opening within the prior body
-            elif (
-                not is_bull1
-                and not is_bull2
-                and not is_bull3
-                and c3 < c2 < c1
-                and body1 / range1 >= self.soldiers_crows_min_body_ratio
-                and body2 / range2 >= self.soldiers_crows_min_body_ratio
-                and body3 / range3 >= self.soldiers_crows_min_body_ratio
-                and o2 <= o1
-                and o2 >= c1
-                and o3 <= o2
-                and o3 >= c2
-            ):
-                avg_body_ratio = (
-                    body1 / range1 + body2 / range2 + body3 / range3
-                ) / 3.0
-                confidence = round(
-                    0.6 + 0.35 * min(avg_body_ratio / self.soldiers_crows_min_body_ratio - 1.0, 1.0),
-                    4,
-                )
-                patterns.append(
-                    CandlestickPattern(
-                        pattern_name="Three Black Crows",
-                        pattern_type="continuation",
-                        direction="bearish",
-                        confidence=min(confidence, 0.95),
-                        index=i,
-                        candles_count=3,
-                        description=(
-                            "Three consecutive large bearish candles each closing"
-                            " progressively lower; strong bearish continuation signal."
-                        ),
-                        timestamp=ts,
-                    )
-                )
-
-        return patterns[: self.max_patterns_per_type]
-
-    def get_pattern_at_index(
+    def get_latest_signals(
         self,
-        patterns: List[CandlestickPattern],
-        index: int,
+        opens: List[float],
+        highs: List[float],
+        lows: List[float],
+        closes: List[float],
+        lookback: int = 5,
     ) -> List[CandlestickPattern]:
         """
-        Filter a list of patterns to those occurring at a specific index.
+        Return only patterns that end within the last *lookback* candles.
 
         Args:
-            patterns: List of :class:`CandlestickPattern` objects to filter.
-            index: Positional integer index in the originating price DataFrame.
+            opens: Open prices.
+            highs: High prices.
+            lows: Low prices.
+            closes: Close prices.
+            lookback: Number of recent bars to include.
 
         Returns:
-            List of patterns whose ``index`` attribute equals ``index``,
-            sorted by confidence descending.
+            Filtered list of recent CandlestickPattern objects.
         """
-        result = [p for p in patterns if p.index == index]
-        result.sort(key=lambda p: p.confidence, reverse=True)
-        return result
-
-    # ================================================================
-    # PRIVATE HELPERS
-    # ================================================================
-
-    def _validate_dataframe(self, prices: pd.DataFrame) -> bool:
-        """
-        Validate that the prices DataFrame has the required structure.
-
-        Args:
-            prices: DataFrame to validate.
-
-        Returns:
-            ``True`` if the DataFrame is valid; ``False`` otherwise (a
-            warning is logged).
-        """
-        if not isinstance(prices, pd.DataFrame):
-            logger.warning("prices must be a pandas DataFrame")
-            return False
-
-        missing = _REQUIRED_COLUMNS - set(prices.columns)
-        if missing:
-            logger.warning("prices DataFrame missing columns: %s", missing)
-            return False
-
-        if len(prices) < 1:
-            logger.warning("prices DataFrame is empty")
-            return False
-
-        return True
-
-    def _trend_context(
-        self,
-        close: np.ndarray,
-        index: int,
-        window: int = 20,
-    ) -> str:
-        """
-        Determine the trend context at a given index using a simple
-        linear-regression slope over the preceding ``window`` bars.
-
-        Args:
-            close: Array of close prices.
-            index: Current bar index.
-            window: Look-back window for slope calculation. Default ``20``.
-
-        Returns:
-            One of ``'uptrend'``, ``'downtrend'``, or ``'sideways'``.
-        """
-        start = max(0, index - window + 1)
-        segment = close[start : index + 1]
-        if len(segment) < 3:
-            return "sideways"
-
-        x = np.arange(len(segment), dtype=float)
-        slope = np.polyfit(x, segment, 1)[0]
-
-        # Normalise slope by average price to get a percentage-per-bar figure
-        avg_price = np.mean(segment)
-        if avg_price <= 0:
-            return "sideways"
-
-        normalised_slope = slope / avg_price
-        threshold = 0.0005  # 0.05 % per bar
-
-        if normalised_slope > threshold:
-            return "uptrend"
-        if normalised_slope < -threshold:
-            return "downtrend"
-        return "sideways"
-
-    @staticmethod
-    def _to_utc_datetime(ts: Any) -> datetime:
-        """
-        Convert an arbitrary timestamp value to a UTC-aware datetime.
-
-        Args:
-            ts: Timestamp from a pandas DatetimeIndex entry (numpy
-                datetime64, pandas Timestamp, or datetime).
-
-        Returns:
-            UTC-aware :class:`datetime` object.
-        """
-        if isinstance(ts, datetime):
-            if ts.tzinfo is None:
-                return ts.replace(tzinfo=timezone.utc)
-            return ts.astimezone(timezone.utc)
-
-        try:
-            pd_ts = pd.Timestamp(ts)
-            if pd_ts.tzinfo is None:
-                pd_ts = pd_ts.tz_localize("UTC")
-            return pd_ts.to_pydatetime().astimezone(timezone.utc)
-        except Exception:
-            return datetime.now(timezone.utc)
+        all_patterns = self.detect(opens, highs, lows, closes)
+        cutoff = len(closes) - lookback
+        return [p for p in all_patterns if p.end_index >= cutoff]
