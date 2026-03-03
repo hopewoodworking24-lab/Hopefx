@@ -139,19 +139,19 @@ Each feature maps to an env-var that can enable or disable it at runtime
 
 ## Experimental / Unreleased
 
-These features exist in the codebase but are **off by default**.
-Set the corresponding env-var to `true` to enable them locally or in a
-feature branch.
+These features exist in the codebase and are **wired into the app** but **off by default**.
+Set the corresponding env-var to `true` to enable them.  Each module registers its own
+FastAPI router at startup — no code changes required.
 
-| Feature | Env Var | Status | Notes |
-|---------|---------|--------|-------|
-| Research Module | `FEATURE_RESEARCH` | EXPERIMENTAL | Quantitative alpha research tooling — WIP |
-| Explainability | `FEATURE_EXPLAINABILITY` | EXPERIMENTAL | SHAP/LIME for ML decisions — WIP |
-| Transparency Reports | `FEATURE_TRANSPARENCY` | EXPERIMENTAL | Regulatory audit reports — WIP |
-| Teams Module | `FEATURE_TEAMS` | EXPERIMENTAL | Multi-user workspaces — WIP |
-| No-Code Builder | `FEATURE_NOCODE` | EXPERIMENTAL | Visual strategy builder — WIP |
-| Replay Engine | `FEATURE_REPLAY` | EXPERIMENTAL | Tick-level market replay — WIP |
-| ML Predictions | `FEATURE_ML_PREDICTIONS` | EXPERIMENTAL | LSTM/Transformer price direction — model training pipeline pending |
+| Feature | Env Var | Status | Routes registered when enabled |
+|---------|---------|--------|-------------------------------|
+| Research Module | `FEATURE_RESEARCH` | EXPERIMENTAL | `GET/POST /api/research/notebooks`, `/api/research/templates` |
+| Explainability | `FEATURE_EXPLAINABILITY` | EXPERIMENTAL | `POST /api/explainability/explain`, `GET /api/explainability/history` |
+| Transparency Reports | `FEATURE_TRANSPARENCY` | EXPERIMENTAL | `POST /api/transparency/executions`, `GET /api/transparency/report` |
+| Teams Module | `FEATURE_TEAMS` | EXPERIMENTAL | `POST /api/teams`, `GET /api/teams/{id}`, `/api/teams/{id}/invite` |
+| No-Code Builder | `FEATURE_NOCODE` | EXPERIMENTAL | `GET/POST /api/nocode/strategies`, `GET /api/nocode/indicators` |
+| Replay Engine | `FEATURE_REPLAY` | EXPERIMENTAL | `POST /api/replay/sessions`, `/api/replay/sessions/{id}/play` |
+| ML Predictions | `FEATURE_ML_PREDICTIONS` | EXPERIMENTAL | `GET /api/ml/status`, `POST /api/ml/features/compute` |
 
 ---
 
