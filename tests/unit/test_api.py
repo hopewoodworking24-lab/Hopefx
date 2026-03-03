@@ -12,7 +12,7 @@ Tests for:
 import json
 import pytest
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -389,7 +389,7 @@ class TestTradingSignalDataclass:
     """Unit tests for the TradingSignal dataclass."""
 
     def _build_signal(self) -> TradingSignal:
-        expiry = datetime.utcnow() + timedelta(minutes=30)
+        expiry = datetime.now(timezone.utc) + timedelta(minutes=30)
         return TradingSignal(
             id="SIG-TEST-001",
             symbol="XAUUSD",
@@ -431,7 +431,7 @@ class TestTradingSignalDataclass:
         assert sig.is_valid is True
 
     def test_is_valid_expired(self):
-        expiry = datetime.utcnow() - timedelta(minutes=1)
+        expiry = datetime.now(timezone.utc) - timedelta(minutes=1)
         sig = TradingSignal(
             id="SIG-EXP-001",
             symbol="XAUUSD",
@@ -547,7 +547,7 @@ class TestRealTimeSignalService:
     def test_get_active_signals_removes_expired(self):
         sig = _make_signal(self.svc)
         # Force expiry
-        sig.expiry = datetime.utcnow() - timedelta(seconds=1)
+        sig.expiry = datetime.now(timezone.utc) - timedelta(seconds=1)
         signals = self.svc.get_active_signals()
         assert sig.id not in [s.id for s in signals]
 
@@ -674,7 +674,7 @@ class TestSignalAnalytics:
 
     def test_record_signal(self):
         analytics = SignalAnalytics()
-        expiry = datetime.utcnow() + timedelta(minutes=30)
+        expiry = datetime.now(timezone.utc) + timedelta(minutes=30)
         sig = TradingSignal(
             id="SIG-ANA-001",
             symbol="XAUUSD",

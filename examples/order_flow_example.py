@@ -7,7 +7,7 @@ flow analysis modules together to monitor live market activity.
 
 import logging
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 
 from data.streaming import StreamingService, StreamConfig, MockDataSource
 from data.time_and_sales import TimeAndSalesService
@@ -43,7 +43,7 @@ def print_metrics(analyzer: AdvancedOrderFlowAnalyzer, symbol: str) -> None:
     pressure = analyzer.get_pressure_gauges(symbol)
 
     print(f"\n{'='*50}")
-    print(f"  Order Flow Snapshot — {symbol}  {datetime.utcnow().strftime('%H:%M:%S')}")
+    print(f"  Order Flow Snapshot — {symbol}  {datetime.now(timezone.utc).strftime('%H:%M:%S')}")
     print(f"{'='*50}")
 
     if aggression:
@@ -78,7 +78,7 @@ def simulate_trades(analyzer: AdvancedOrderFlowAnalyzer, symbol: str) -> None:
         price = base_price + _rng.uniform(-5, 5)
         size = _rng.uniform(0.1, 2.0)
         side = "buy" if _rng.random() > 0.45 else "sell"
-        ts = datetime.utcnow()
+        ts = datetime.now(timezone.utc)
         analyzer.add_trade(symbol, price, size, side, ts)
 
 

@@ -6,7 +6,7 @@ horizontal lines, rectangles, Fibonacci retracements, text labels,
 channels, arc/circle annotations, pitchforks, and Elliott Wave labels.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 # Default Fibonacci retracement and extension levels
@@ -57,13 +57,13 @@ class Drawing:
         self.drawing_id = (
             drawing_id
             if drawing_id is not None
-            else f"{drawing_type}_{datetime.utcnow().timestamp()}"
+            else f"{drawing_type}_{datetime.now(timezone.utc).timestamp()}"
         )
         self.color = color
         self.line_width = line_width
         self.visible: bool = True
         self.properties: Dict[str, Any] = {}
-        self.created_at: datetime = datetime.utcnow()
+        self.created_at: datetime = datetime.now(timezone.utc)
 
     def __repr__(self) -> str:
         return f"Drawing(type={self.drawing_type!r}, id={self.drawing_id!r})"
@@ -506,7 +506,7 @@ class DrawingToolkit:
             "wave_count": len(points),
             "wave_type": wave_type,
         }
-        drawing.drawing_id = f"EW_{datetime.utcnow().timestamp()}"
+        drawing.drawing_id = f"EW_{datetime.now(timezone.utc).timestamp()}"
         return self._store(drawing)
 
     # ------------------------------------------------------------------
