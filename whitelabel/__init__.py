@@ -16,7 +16,7 @@ Key components:
 
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -205,11 +205,11 @@ class Tenant:
         self.reseller_id = reseller_id
         self.custom_domain = custom_domain
         self.theme: BrandTheme = theme if theme is not None else BrandTheme()
-        self.created_at: datetime = datetime.utcnow()
+        self.created_at: datetime = datetime.now(timezone.utc)
 
     def is_active(self) -> bool:
         """Return True if the tenant is currently active or in trial (and not expired)."""
-        if self.expires_at is not None and self.expires_at <= datetime.utcnow():
+        if self.expires_at is not None and self.expires_at <= datetime.now(timezone.utc):
             return False
         return self.status in (TenantStatus.ACTIVE, TenantStatus.TRIAL)
 
@@ -320,7 +320,7 @@ class WhiteLabelManager:
         tenant_id = _generate_id("WL")
         if trial_days > 0:
             status = TenantStatus.TRIAL
-            expires_at: Optional[datetime] = datetime.utcnow() + timedelta(days=trial_days)
+            expires_at: Optional[datetime] = datetime.now(timezone.utc) + timedelta(days=trial_days)
         else:
             status = TenantStatus.ACTIVE
             expires_at = None
